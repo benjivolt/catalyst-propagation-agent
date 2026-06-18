@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Catalyst Propagation Agent</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-copy">
+      <p class="eyebrow">Biotech catalyst intelligence</p>
+      <h1>Catalyst Propagation Agent</h1>
+      <p class="sub">Monitor biotech watchlists, ingest public catalysts, and generate cited target, indication, and peer read-through reports without assuming blanket sector contagion.</p>
+    </div>
+    <div class="hero-actions">
+      <form action="/forms/seed" method="post"><button>Seed real biotech watchlist</button></form>
+      <form action="/forms/demo/masterpiece" method="post"><button class="primary">Create masterpiece demo reports</button></form>
+      <form action="/forms/monitor" method="post"><button>Run adaptive monitor now</button></form>
+      <form action="/forms/scheduler/tick" method="post"><button>Run due scheduler tick</button></form>
+      <a class="button-link" href="/learning">AI learning dashboard</a>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="cards stats">
+      <div class="card"><span>{{ stats.active_companies }}</span><p>Active companies</p></div>
+      <div class="card"><span>{{ stats.catalysts }}</span><p>Catalysts</p></div>
+      <div class="card"><span>{{ stats.reports }}</span><p>Cited reports</p></div>
+      <div class="card"><span>{{ stats.adaptive_sources }}</span><p>Adaptive source states</p></div>
+      <div class="card"><span>{{ stats.due_sources }}</span><p>Sources due now</p></div>
+      <div class="card"><span>{{ stats.ai_predictions }}</span><p>AI predictions</p></div>
+      <div class="card"><span>{{ stats.learning_errors }}</span><p>Learning error memories</p></div>
+    </section>
+
+    <section class="panel scheduler-panel">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Cost-aware adaptive scheduler</p>
+          <h2>Automatic source priority engine</h2>
+          <p class="hint">Each company-source pair gets a dynamic score based on catalyst-window risk, source reliability, expected impact, past reward, backoff, exploration, and cost. The LLM is gated until a likely catalyst passes the cheap detector. {% if scheduler.external_worker %}Production mode: external scheduler worker is enabled.{% else %}Local mode: in-process scheduler can run with the web app.{% endif %}</p>
+        </div>
+        <div class="scheduler-kpis">
+          <span><strong>{{ scheduler.sources }}</strong> source states</span>
+          <span><strong>{{ scheduler.due_count }}</strong> due</span>
+          <span><strong>{{ scheduler.high_priority }}</strong> high-priority</span>
+          <span><strong>${{ '%.3f'|format(scheduler.daily_budget_used) }}</strong> / ${{ '%.2f'|format(scheduler.daily_budget) }} today</span>
+        </div>
+      </div>
+      {% if scheduler.rows %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Company</th><th>Source</th><th>Priority</th><th>Next check</th><th>Reward</th><th>Backoff</th><th>Why this score?</th></tr></thead>
+          <tbody>
+            {% for item in scheduler.rows %}
+            <tr>
+              <td><a href="/company/{{ item.company_id }}">{{ item.company_name }}</a><br><small>{{ item.ticker or '' }}</small></td>
+              <td><span class="pill">{{ item.source_name }}</span><br><small>reliability {{ '%.2f'|format(item.reliability_score) }} · cost {{ '%.2f'|format(item.check_cost) }}</small></td>
+              <td><div class="score-bar"><span style="width: {{ (item.priority_score * 100)|round|int }}%"></span></div><strong>{{ '%.3f'|format(item.priority_score) }}</strong></td>
+              <td><small>{{ item.next_check_at or 'not scheduled' }}</small></td>
+              <td>{{ '%.2f'|format(item.average_reward) }}</td>
+              <td>{{ item.backoff_level }}</td>
+              <td class="muted reason">{{ item.reason }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+        <p class="empty">Seed or add companies to create adaptive source states.</p>
+      {% endif %}
+
+      {% if scheduler.recent_jobs %}
+      <h3>Recent adaptive jobs</h3>
+      <ul class="runs">
+        {% for job in scheduler.recent_jobs %}
+          <li><strong>{{ job.status }}</strong> — {{ job.company_name }} / {{ job.source_name }} — {{ job.new_catalysts }} new, {{ job.duplicates }} duplicates, reward {{ '%.1f'|format(job.reward_value) }} — {{ job.message or '' }} <small>{{ job.started_at }}</small></li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </section>
+
+    <section class="grid two">
+      <article class="panel">
+        <h2>Add company to watchlist</h2>
+        <p class="hint">Use real company-specific context. Better peers and targets produce better read-through analysis.</p>
+        <form action="/forms/company" method="post" class="stack">
+          <label>Company name <input name="name" required placeholder="Madrigal Pharmaceuticals" /></label>
+          <label>Ticker <input name="ticker" placeholder="MDGL" /></label>
+          <label>Aliases / drugs <textarea name="aliases" placeholder="Madrigal, Rezdiffra, resmetirom"></textarea></label>
+          <label>Targets <textarea name="targets" placeholder="THR-beta, thyroid hormone receptor beta"></textarea></label>
+          <label>Indications <textarea name="indications" placeholder="MASH, NASH, metabolic dysfunction-associated steatohepatitis"></textarea></label>
+          <label>Official source URLs <textarea name="source_urls" placeholder="https://ir.company.com/news-releases&#10;https://company.com/news"></textarea></label>
+          <label>Analyst notes <textarea name="notes" rows="3" placeholder="What should the agent watch carefully for this company?"></textarea></label>
+          <label>Peers JSON
+            <textarea name="peers_json" class="mono" rows="8">[
+  {
+    "company": "Viking Therapeutics",
+    "ticker": "VKTX",
+    "relationship": "same target and same indication competitor",
+    "target": "VK2809 / thyroid hormone receptor beta",
+    "indication": "MASH",
+    "evidence_url": "https://vikingtherapeutics.com/pipeline/vk2809/",
+    "evidence_title": "Viking VK2809 pipeline evidence",
+    "evidence_excerpt": "Viking describes VK2809 as a thyroid hormone receptor beta program in MASH/NASH.",
+    "expected_readthrough": "mixed validation and competition; do not assume blanket sector contagion"
+  }
+]</textarea>
+          </label>
+          <button class="primary">Add company</button>
+        </form>
+      </article>
+
+      <article class="panel">
+        <h2>Manual catalyst</h2>
+        <p class="hint">Highest quality demo path: paste a real press release, FDA page, SEC filing excerpt, or trusted article. The report will cite it.</p>
+        <form action="/forms/manual-catalyst" method="post" class="stack">
+          <label>Company
+            <select name="company_id" required>
+              {% for company in companies %}
+                <option value="{{ company.id }}">{{ company.name }} {% if company.ticker %}({{ company.ticker }}){% endif %}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>Title <input name="title" required placeholder="Company announces positive Phase 2 results..." /></label>
+          <label>Source URL <input name="url" placeholder="https://..." /></label>
+          <label>Publisher <input name="publisher" placeholder="Company press release / FDA / SEC / STAT" /></label>
+          <label>Date <input name="event_date" placeholder="YYYY-MM-DD" /></label>
+          <label>Event type
+            <select name="event_type">
+              <option value="">Auto-classify</option>
+              <option value="trial_readout">Trial readout</option>
+              <option value="fda_decision">FDA decision</option>
+              <option value="licensing_deal">Licensing deal</option>
+              <option value="acquisition">Acquisition</option>
+              <option value="other_catalyst">Other catalyst</option>
+            </select>
+          </label>
+          <label>Source excerpt <textarea name="excerpt" rows="8" required placeholder="Paste the key paragraphs here..."></textarea></label>
+          <button class="primary">Create cited report</button>
+        </form>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Watchlist</p>
+          <h2>Company coverage</h2>
+        </div>
+      </div>
+      {% if companies %}
+      <div class="company-grid">
+        {% for c in companies %}
+        <article class="company-card">
+          <div class="company-top">
+            <div>
+              <h3><a href="/company/{{ c.id }}">{{ c.name }}</a></h3>
+              <p>{{ c.ticker or 'Private/unknown ticker' }} · {{ 'active' if c.active else 'paused' }}</p>
+            </div>
+            <form action="/forms/company/{{ c.id }}/delete" method="post" onsubmit="return confirm('Delete this company and its catalysts?');"><button class="ghost">Delete</button></form>
+          </div>
+          <div class="tags">
+            {% for t in c.targets[:4] %}<span>{{ t }}</span>{% endfor %}
+          </div>
+          <p class="muted"><strong>Indications:</strong> {{ c.indications|join(', ') or 'Not set' }}</p>
+          <p class="muted"><strong>Peers:</strong> {{ c.peers|length }} · <strong>Source URLs:</strong> {{ c.source_urls|length }}</p>
+          {% if c.notes %}<p class="note">{{ c.notes }}</p>{% endif %}
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+        <p class="empty">No companies yet. Seed the real biotech watchlist or add your own company.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Reports</p>
+          <h2>Detected catalysts</h2>
+        </div>
+      </div>
+      {% if catalysts %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Event</th><th>Company</th><th>Type</th><th>Status</th><th>Direction</th><th>Report</th></tr></thead>
+          <tbody>
+            {% for cat in catalysts %}
+            <tr>
+              <td><strong>{{ cat.title }}</strong><br><small>{{ cat.created_at }}</small></td>
+              <td>{{ cat.company_name }} {% if cat.ticker %}({{ cat.ticker }}){% endif %}</td>
+              <td><span class="pill">{{ cat.event_type }}</span></td>
+              <td>{{ cat.status }}</td>
+              <td>{% if cat.overall_direction %}<span class="dir {{ cat.overall_direction }}">{{ cat.overall_direction }}</span> {{ '%.0f'|format(cat.overall_confidence * 100) }}%{% endif %}</td>
+              <td>{% if cat.report_id %}<a class="button-link" href="/report/{{ cat.report_id }}">Open</a>{% else %}<form action="/forms/catalysts/{{ cat.id }}/analyze" method="post"><button>Analyze</button></form>{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+        <p class="empty">No catalysts yet. Add a manual catalyst or run the monitor.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>Monitor runs</h2>
+      {% if runs %}
+      <ul class="runs">
+        {% for run in runs %}
+          <li><strong>{{ run.status }}</strong> — {{ run.new_catalysts }} new catalysts — {{ run.message or '' }} <small>{{ run.started_at }}</small></li>
+        {% endfor %}
+      </ul>
+      {% else %}<p class="empty">No monitor runs yet.</p>{% endif %}
+    </section>
+  </main>
+</body>
+</html>

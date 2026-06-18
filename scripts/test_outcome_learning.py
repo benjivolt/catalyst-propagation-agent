@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.db import init_db, execute, row
+from app.services.outcome_learning import CandidateReview, record_prediction, run_due_outcome_checks, run_policy_update, learning_dashboard
+
+
+def main() -> None:
+    init_db()
+    company_id = execute(
+        """
+        INSERT INTO companies (ticker, name, aliases_json, targets_json, indications_json, peers_json, source_urls_json, notes, active)
+        VALUES ('TEST', 'Outcome Learning Test Bio', '["TestDrug"]', '["TargetX"]', '["DiseaseY"]', '[]', '[]', 'temporary learning test company', 1)
+        """
+    )
+    review = CandidateReview(
+        decision="store_as_context",
+        event_type="trial_readout",
+        confidence=0.67,
+        direction="unknown",
+        company_detected=True,
+        asset_detected=True,
+        required_fields_present=False,
+        missing_fields=["explicit endpoint result"],
+        risk_flags=["test_context_candidate"],
+        evidence_needed_later=["official readout confirmation"],
+        reasoning_summary="Test prediction for the Catalyst Outcome Learning Engine.",
+        model_name="test_fixture",
+    )
+    prediction_id = record_prediction(
+        company_id=company_id,
+        source_type="pubmed",
+        source_key_value=f"test-learning-{company_id}",
+        source_url="https://example.invalid/test-learning",
+        source_title="Test context item",
+        review=review,
+        gate_score=0.55,
+    )
+    execute("UPDATE ai_prediction_outcome_checks SET due_at = CURRENT_TIMESTAMP WHERE prediction_id = ?", (prediction_id,))
+    outcome = run_due_outcome_checks(limit=10)
+    policy = run_policy_update()
+    dash = learning_dashboard()
+    assert outcome["processed"] >= 1
+    assert row("SELECT id FROM ai_predictions WHERE id = ?", (prediction_id,))
+    print({"prediction_id": prediction_id, "outcome": outcome, "policy": policy, "prediction_total": dash["prediction_counts"].get("total")})
+
+
+if __name__ == "__main__":
+    main()

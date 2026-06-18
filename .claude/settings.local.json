@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(run)",
+      "Bash(bash run_local.sh)",
+      "Bash(echo \"PID: $!\")"
+    ]
+  }
+}
