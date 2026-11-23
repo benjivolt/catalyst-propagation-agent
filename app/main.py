@@ -6,7 +6,7 @@ import logging
 import secrets
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -410,6 +410,16 @@ def _field(form: Any, name: str, limit: int, default: str = "") -> str:
 
 
 def redirect(path: str) -> RedirectResponse:
+    decoded = unquote(path)
+    if (
+        not path.startswith("/")
+        or path.startswith("//")
+        or not decoded.startswith("/")
+        or decoded.startswith("//")
+        or "\\" in decoded
+        or any(ord(char) < 32 or ord(char) == 127 for char in decoded)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid redirect target")
     return RedirectResponse(path, status_code=303)
 
 

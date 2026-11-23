@@ -4,8 +4,9 @@ import base64
 import socket
 
 import pytest
+from fastapi import HTTPException
 
-from app.main import safe_url
+from app.main import redirect, safe_url
 from app.services.sources import SourceFetchError, assert_public_url
 from app.services.utils import redact_secrets
 
@@ -26,6 +27,32 @@ from app.services.utils import redact_secrets
 )
 def test_safe_url(value, expected):
     assert safe_url(value) == expected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "https://evil.example",
+        "//evil.example",
+        "///evil.example",
+        "/\\evil.example",
+        "/%2fevil.example",
+        "/%5cevil.example",
+        "/%0d%0aevil",
+        "",
+    ],
+)
+def test_redirect_refuses_external_or_ambiguous_targets(path):
+    with pytest.raises(HTTPException) as error:
+        redirect(path)
+    assert error.value.status_code == 400
+
+
+@pytest.mark.parametrize("path", ["/", "/report/1", "/watchlist?tab=active"])
+def test_redirect_preserves_local_targets(path):
+    response = redirect(path)
+    assert response.status_code == 303
+    assert response.headers["location"] == path
 
 
 def _resolve_to(address: str):

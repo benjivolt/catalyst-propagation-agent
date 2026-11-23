@@ -108,9 +108,9 @@ def send_report_alert(report_id: int, *, force: bool = False) -> dict[str, Any]:
                 resp.raise_for_status()
             _record(report_id, "slack", "slack_webhook", "sent", payload)
             deliveries += 1
-        except Exception as exc:
-            failures.append(f"slack: {redact_secrets(str(exc))}")
-            _record(report_id, "slack", "slack_webhook", "failed", payload, str(exc))
+        except Exception:
+            failures.append("slack: delivery failed")
+            _record(report_id, "slack", "slack_webhook", "failed", payload, "Slack delivery failed")
 
     if settings.smtp_host and settings.alert_email_to:
         try:
@@ -127,9 +127,9 @@ def send_report_alert(report_id: int, *, force: bool = False) -> dict[str, Any]:
                 smtp.send_message(msg)
             _record(report_id, "email", settings.alert_email_to, "sent", payload)
             deliveries += 1
-        except Exception as exc:
-            failures.append(f"email: {exc}")
-            _record(report_id, "email", settings.alert_email_to, "failed", payload, str(exc))
+        except Exception:
+            failures.append("email: delivery failed")
+            _record(report_id, "email", settings.alert_email_to, "failed", payload, "Email delivery failed")
 
     if deliveries == 0 and not failures:
         _record(report_id, "none", "not_configured", "skipped", payload, "No Slack webhook or SMTP target configured")

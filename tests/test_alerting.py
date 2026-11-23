@@ -52,3 +52,30 @@ def test_approved_report_without_channels_is_skipped(report_id, set_setting):
 def test_send_alert_route_refuses_unapproved_report(client, report_id):
     _set_review(report_id, "needs_review")
     assert client.post(f"/api/reports/{report_id}/send-alert").json()["reason"] == "not_approved"
+
+
+@pytest.mark.parametrize("channel", ["slack", "email"])
+def test_transport_exceptions_are_not_exposed(client, report_id, set_setting, monkeypatch, channel):
+    from app.services import alerting
+
+    class UnavailableTransport:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("smtp.private.invalid failed while reading /srv/private/settings.ini")
+
+    _set_review(report_id, "approved")
+    set_setting(
+        alerts_enabled=True,
+        slack_webhook_url="https://hooks.slack.com/services/T/B/X" if channel == "slack" else "",
+        smtp_host="smtp.private.invalid" if channel == "email" else "",
+        alert_email_to="reviewer@example.invalid" if channel == "email" else "",
+    )
+    monkeypatch.setattr(alerting.httpx, "Client", UnavailableTransport)
+    monkeypatch.setattr(alerting.smtplib, "SMTP", UnavailableTransport)
+
+    response = client.post(f"/api/reports/{report_id}/send-alert")
+    assert response.json()["errors"] == [f"{channel}: delivery failed"]
+    assert "smtp.private.invalid" not in response.text
+    assert "/srv/private" not in response.text
+    delivery = db.row("SELECT error FROM alert_deliveries WHERE report_id = ? ORDER BY id DESC", (report_id,))
+    assert "smtp.private.invalid" not in delivery["error"]
+    assert "/srv/private" not in delivery["error"]
