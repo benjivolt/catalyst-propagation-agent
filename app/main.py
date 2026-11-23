@@ -6,7 +6,7 @@ import logging
 import secrets
 from contextlib import asynccontextmanager
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlparse, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -420,9 +420,9 @@ def redirect(path: str) -> RedirectResponse:
         or any(ord(char) < 32 or ord(char) == 127 for char in decoded)
     ):
         raise HTTPException(status_code=400, detail="Invalid redirect target")
-    if urlsplit(path).netloc or urlsplit(path).scheme:
-        raise HTTPException(status_code=400, detail="Invalid redirect target")
-    return RedirectResponse(path, status_code=303)
+    if not urlparse(path).netloc and not urlparse(path).scheme:
+        return RedirectResponse(path, status_code=303)
+    raise HTTPException(status_code=400, detail="Invalid redirect target")
 
 
 @app.post("/forms/company")
