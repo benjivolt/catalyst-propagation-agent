@@ -1,190 +1,139 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Report — {{ report.catalyst_title }}</title>
-  <link rel="stylesheet" href="/static/app.css" />
-</head>
-<body>
-  <header class="hero compact">
-    <div>
-      <a href="/" class="back">← Dashboard</a>
-      <p class="eyebrow">{{ report.company_name }} {% if report.ticker %}({{ report.ticker }}){% endif %} · {{ report.event_type }}</p>
-      <h1>{{ report.catalyst_title }}</h1>
-      <p class="sub">{{ report.plain_language_summary }}</p>
-    </div>
-    <div class="scorecard">
-      <span class="dir {{ report.overall_direction }}">{{ report.overall_direction }}</span>
-      <strong>{{ '%.0f'|format(report.overall_confidence * 100) }}%</strong>
-      <small>overall confidence</small>
-      {% if report.review %}<span class="pill review-{{ report.review.status }}">{{ report.review.status|replace('_', ' ') }}</span>{% endif %}
-    </div>
-  </header>
+{% extends "base.html" %}
+{% block title %}{{ report.catalyst_title }} · Catalyst Propagation{% endblock %}
+{% block content %}
+{% set audit = report.evidence_audit %}
+{% set graph = report.evidence_graph.summary if report.evidence_graph else None %}
+{% set bio = report.biomedical_context_audit %}
 
-  <main class="layout">
-    <section class="panel">
-      <p class="eyebrow">Evidence audit</p>
-      {% if report.evidence_audit %}
-      <div class="audit-grid">
-        <div class="audit-card"><span>Grade</span><strong>{{ report.evidence_audit.evidence_grade }}</strong></div>
-        <div class="audit-card"><span>Citation coverage</span><strong>{{ '%.0f'|format(report.evidence_audit.citation_coverage * 100) }}%</strong></div>
-        <div class="audit-card"><span>Unsupported effects</span><strong>{{ report.evidence_audit.unsupported_effect_count }}</strong></div>
-        <div class="audit-card"><span>Weak claims</span><strong>{{ report.evidence_audit.weak_claim_count }}</strong></div>
-        <div class="audit-card"><span>Peer relationship gaps</span><strong>{{ report.evidence_audit.audit.peer_relationship_missing_count if report.evidence_audit.audit else 0 }}</strong></div>
-        <div class="audit-card"><span>Relationship sources</span><strong>{{ report.evidence_audit.audit.relationship_source_count if report.evidence_audit.audit else 0 }}</strong></div>
-      </div>
-      <p class="hint">The evidence audit checks that each effect has cited claims linked to stored source documents. Peer read-throughs now need URL-verified relationship evidence too, not just a catalyst press release or pasted watchlist note.</p>
-      {% endif %}
+<div class="page-head">
+  <div>
+    <a class="back" href="/company/{{ report.company_id }}">{{ report.company_name }}{% if report.ticker %} ({{ report.ticker }}){% endif %}</a>
+    <h1>{{ report.catalyst_title }}</h1>
+    <p class="sub">{{ report.event_type|humanize(true) }}{% if report.event_date %}, {{ report.event_date }}{% endif %}</p>
+  </div>
+  <div class="verdict">
+    <span class="dir {{ report.overall_direction }}">{{ report.overall_direction }}</span>
+    <strong class="num">{{ '%.0f'|format(report.overall_confidence * 100) }}%</strong>
+    <span class="muted">confidence</span>
+    {% if report.review %}<span class="status review-{{ report.review.status }}">{{ report.review.status|humanize }}</span>{% endif %}
+  </div>
+</div>
 
-      {% if report.evidence_graph and report.evidence_graph.summary and report.evidence_graph.summary.total %}
-      <div class="review-box veg-box">
-        <p class="eyebrow">Verified Evidence Graph</p>
-        <h2>Claim-level source verification</h2>
-        <p class="hint">Every report claim is now checked against an exact stored quote with paragraph ID, character offsets, source-type requirements, contradiction risk, and a confidence cap. Unsupported claims are blocked from automatic approval.</p>
-        <form action="/forms/reports/{{ report.id }}/verify-evidence-graph" method="post" class="inline-form">
-          <button>Rebuild evidence graph</button>
-          <span class="hint">Use after editing sources or re-running source verification.</span>
-        </form>
-        <div class="audit-grid mini">
-          <div class="audit-card"><span>Atomic claims</span><strong>{{ report.evidence_graph.summary.total or 0 }}</strong></div>
-          <div class="audit-card"><span>Verified</span><strong>{{ report.evidence_graph.summary.verified or 0 }}</strong></div>
-          <div class="audit-card"><span>Weakly verified</span><strong>{{ report.evidence_graph.summary.weak or 0 }}</strong></div>
-          <div class="audit-card"><span>Unsupported</span><strong>{{ report.evidence_graph.summary.unsupported or 0 }}</strong></div>
-          <div class="audit-card"><span>Contradicted</span><strong>{{ report.evidence_graph.summary.contradicted or 0 }}</strong></div>
-          <div class="audit-card"><span>Needs review</span><strong>{{ report.evidence_graph.summary.needs_review or 0 }}</strong></div>
+<div class="report">
+  <article>
+    {% if report.plain_language_summary %}<p class="summary">{{ report.plain_language_summary }}</p>{% endif %}
+
+    {% for layer in ['target', 'indication', 'peer'] %}
+    {% set layer_effects = report.effects | selectattr('layer', 'equalto', layer) | list %}
+    <section class="layer">
+      <h2>{{ layer|capitalize }} effects</h2>
+      {% for effect in layer_effects %}
+      <div class="effect">
+        <div class="effect-head">
+          <h3>{{ effect.entity }}</h3>
+          <span><span class="dir {{ effect.direction }}">{{ effect.direction }}</span> <span class="num">{{ '%.0f'|format(effect.confidence * 100) }}%</span></span>
         </div>
-      </div>
-      {% endif %}
-
-      {% if report.biomedical_context_audit %}
-      <div class="review-box clinical-audit">
-        <p class="eyebrow">Biomedical context audit</p>
-        <h2>Clinical/deal detail check: {{ report.biomedical_context_audit.biomedical_evidence_level|capitalize }}</h2>
-        <p class="hint">The system checks whether the source includes important context like trial phase, endpoints, safety, trial design, statistics/sample size, regulatory details, or deal terms. Thin context caps confidence automatically.</p>
-        <div class="audit-grid mini">
-          <div class="audit-card"><span>Phase</span><strong>{{ report.biomedical_context_audit.phase_detected or 'Missing' }}</strong></div>
-          <div class="audit-card"><span>Endpoint</span><strong>{{ 'Yes' if report.biomedical_context_audit.has_endpoint_detail else 'No' }}</strong></div>
-          <div class="audit-card"><span>Safety</span><strong>{{ 'Yes' if report.biomedical_context_audit.has_safety_detail else 'No' }}</strong></div>
-          <div class="audit-card"><span>Design</span><strong>{{ 'Yes' if report.biomedical_context_audit.has_trial_design_detail else 'No' }}</strong></div>
-          <div class="audit-card"><span>Stats/sample</span><strong>{{ 'Yes' if report.biomedical_context_audit.has_p_value_or_statistic or report.biomedical_context_audit.sample_size_detected else 'No' }}</strong></div>
-          <div class="audit-card"><span>Missing</span><strong>{{ report.biomedical_context_audit.missing_critical_fields|join(', ') if report.biomedical_context_audit.missing_critical_fields else 'None' }}</strong></div>
-        </div>
-        {% if report.biomedical_context_audit.clinical_facts %}
-        <p class="hint"><strong>Extracted facts:</strong> {{ report.biomedical_context_audit.clinical_summary }}</p>
+        {% if effect.readthrough_type %}<p class="sub">{{ effect.readthrough_type|humanize }}</p>{% endif %}
+        <p>{{ effect.rationale }}</p>
+        {% if effect.claims %}
+        <ul class="claims">
+          {% for claim in effect.claims %}
+          <li>
+            {{ claim.claim }}
+            {% if claim.citation_url %}<a href="{{ claim.citation_url|safe_url }}" target="_blank" rel="noopener noreferrer">source</a>{% endif %}
+            <span class="check status-{{ claim.verification_status or 'not_verified' }}">{{ (claim.verification_status or 'not verified')|humanize }}</span>
+            {% if claim.exact_quote %}<blockquote>{{ claim.exact_quote }}</blockquote>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
         {% endif %}
       </div>
-      {% endif %}
+      {% else %}
+      <p class="muted">No {{ layer }} effects.</p>
+      {% endfor %}
+    </section>
+    {% endfor %}
 
-      <div class="review-box">
-        <p class="eyebrow">Human review gate</p>
-        <h2>Analyst approval</h2>
-        <p class="hint">Reports are automatically marked needs review unless the evidence gate is very strong. This prevents a fluent model answer from being treated as investment-grade without analyst checking.</p>
-        <form action="/forms/reports/{{ report.id }}/review" method="post" class="review-form">
-          <label>Status
-            <select name="status">
-              <option value="needs_review" {% if report.review and report.review.status == 'needs_review' %}selected{% endif %}>Needs review</option>
-              <option value="approved" {% if report.review and report.review.status == 'approved' %}selected{% endif %}>Approved</option>
-              <option value="rejected" {% if report.review and report.review.status == 'rejected' %}selected{% endif %}>Rejected</option>
-            </select>
-          </label>
-          <label>Reviewer <input name="reviewer" value="{{ report.review.reviewer if report.review else '' }}" placeholder="Analyst name" /></label>
-          <label>Notes <textarea name="notes" rows="2" placeholder="What was checked?">{{ report.review.notes if report.review else '' }}</textarea></label>
-          <button>Save review</button>
-        </form>
-      </div>
-
-      {% if report.source_correlations %}
-      <div class="review-box correlation-box">
-        <p class="eyebrow">Corroboration matrix</p>
-        <h2>How strongly each effect is source-backed</h2>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Layer</th><th>Entity</th><th>Distinct sources</th><th>Official</th><th>Verified</th><th>Status</th></tr></thead>
-            <tbody>
-              {% for c in report.source_correlations %}
-              <tr>
-                <td>{{ c.layer }}</td>
-                <td>{{ c.entity }}</td>
-                <td>{{ c.distinct_source_count }}</td>
-                <td>{{ c.official_source_count }}</td>
-                <td>{{ c.verified_source_count }}</td>
-                <td><span class="pill verification">{{ c.corroboration_status }}</span></td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      </div>
-      {% endif %}
-
-      <p class="eyebrow">Evidence</p>
-      <h2>Source evidence used by the report</h2>
-      {% if report.source_docs %}
-      <form action="/forms/catalysts/{{ report.catalyst_id }}/verify-sources" method="post" class="inline-form">
-        <button>Fetch + verify source URLs</button>
-        <span class="hint">Use this before final approval when internet access is available.</span>
-      </form>
-      {% endif %}
+    <details>
+      <summary>Sources ({{ report.source_docs|length }})</summary>
       <ol class="sources">
         {% for src in report.source_docs %}
-        <li id="source-{{ loop.index }}">
-          <a href="{{ src.url }}" target="_blank" rel="noreferrer">{{ src.title }}</a>
-          <small>{{ src.publisher or 'Source' }} {% if src.published_at %}— {{ src.published_at }}{% endif %}</small>
-          <div class="source-verification">
-            <span class="pill">{{ src.source_type }}</span>
-            <span class="pill verification">{{ src.verification_status or 'not_checked' }}</span>
-            <span class="pill">{{ '%.0f'|format((src.verification_score or 0) * 100) }}% verified</span>
-          </div>
-          {% if src.verification_reason %}<p class="hint">{{ src.verification_reason }}</p>{% endif %}
-          <p>{{ src.excerpt }}</p>
+        <li>
+          <a href="{{ src.url|safe_url }}" target="_blank" rel="noopener noreferrer">{{ src.title }}</a>
+          <div class="sub">{{ src.publisher or src.source_type }}{% if src.published_at %}, {{ src.published_at }}{% endif %}. {{ (src.verification_status or 'not checked')|humanize(true) }}.</div>
+          {% if src.excerpt %}<p>{{ src.excerpt }}</p>{% endif %}
         </li>
         {% endfor %}
       </ol>
-    </section>
-
-    {% for layer in ['target', 'indication', 'peer'] %}
-    <section class="panel">
-      <p class="eyebrow">Layer {{ loop.index }}</p>
-      <h2>{{ layer|capitalize }} effects</h2>
-      {% set layer_effects = report.effects | selectattr('layer', 'equalto', layer) | list %}
-      {% if layer_effects %}
-        <div class="effect-list">
-        {% for effect in layer_effects %}
-          <article class="effect">
-            <div class="effect-head">
-              <h3>{{ effect.entity }}</h3>
-              <div><span class="dir {{ effect.direction }}">{{ effect.direction }}</span> <strong>{{ '%.0f'|format(effect.confidence * 100) }}%</strong></div>
-            </div>
-            <p><span class="pill">{{ effect.readthrough_type }}</span></p>
-            <p>{{ effect.rationale }}</p>
-            {% if effect.claims %}
-            <h4>Cited claims</h4>
-            <ul class="claims">
-              {% for claim in effect.claims %}
-                <li class="claim-item">
-                  <div class="claim-main">{{ claim.claim }} {% if claim.citation_url %}<a href="{{ claim.citation_url }}" target="_blank" rel="noreferrer">source</a>{% endif %}</div>
-                  <div class="claim-verification-row">
-                    <span class="pill verification status-{{ claim.verification_status or 'not_verified' }}">{{ (claim.verification_status or 'not verified')|replace('_', ' ') }}</span>
-                    <span class="pill">{{ '%.0f'|format((claim.verification_score or 0) * 100) }}% entailment</span>
-                    <span class="pill">cap {{ '%.0f'|format((claim.confidence_cap or 0) * 100) }}%</span>
-                  </div>
-                  {% if claim.exact_quote %}
-                  <blockquote class="evidence-quote">{{ claim.exact_quote }}</blockquote>
-                  {% endif %}
-                  {% if claim.verifier_reason %}<p class="hint">{{ claim.verifier_reason }}</p>{% endif %}
-                </li>
-              {% endfor %}
-            </ul>
-            {% endif %}
-          </article>
-        {% endfor %}
-        </div>
-      {% else %}
-        <p class="empty">No {{ layer }} effects returned.</p>
+      {% if report.source_docs %}
+      <form action="/forms/catalysts/{{ report.catalyst_id }}/verify-sources" method="post"><button class="btn small">Re-fetch and verify sources</button></form>
       {% endif %}
-    </section>
-    {% endfor %}
-  </main>
-</body>
-</html>
+    </details>
+
+    <details>
+      <summary>Evidence checks</summary>
+      {% if audit %}
+      <h3>Citations</h3>
+      <dl class="facts compact">
+        <div><dt>Grade</dt><dd>{{ audit.evidence_grade }}</dd></div>
+        <div><dt>Citation coverage</dt><dd class="num">{{ '%.0f'|format(audit.citation_coverage * 100) }}%</dd></div>
+        <div><dt>Unsupported effects</dt><dd class="num">{{ audit.unsupported_effect_count }}</dd></div>
+        <div><dt>Weak claims</dt><dd class="num">{{ audit.weak_claim_count }}</dd></div>
+      </dl>
+      {% endif %}
+      {% if graph and graph.total %}
+      <h3>Claim verification</h3>
+      <dl class="facts compact">
+        <div><dt>Claims</dt><dd class="num">{{ graph.total or 0 }}</dd></div>
+        <div><dt>Verified</dt><dd class="num">{{ graph.verified or 0 }}</dd></div>
+        <div><dt>Weak</dt><dd class="num">{{ graph.weak or 0 }}</dd></div>
+        <div><dt>Unsupported</dt><dd class="num">{{ graph.unsupported or 0 }}</dd></div>
+        <div><dt>Contradicted</dt><dd class="num">{{ graph.contradicted or 0 }}</dd></div>
+      </dl>
+      <form action="/forms/reports/{{ report.id }}/verify-evidence-graph" method="post"><button class="btn small">Rebuild claim verification</button></form>
+      {% endif %}
+      {% if bio %}
+      <h3>Clinical detail in the source</h3>
+      <dl class="facts compact">
+        <div><dt>Phase</dt><dd>{{ bio.phase_detected or 'Not stated' }}</dd></div>
+        <div><dt>Endpoint</dt><dd>{{ 'Yes' if bio.has_endpoint_detail else 'No' }}</dd></div>
+        <div><dt>Safety</dt><dd>{{ 'Yes' if bio.has_safety_detail else 'No' }}</dd></div>
+        <div><dt>Statistics</dt><dd>{{ 'Yes' if bio.has_p_value_or_statistic or bio.sample_size_detected else 'No' }}</dd></div>
+      </dl>
+      {% if bio.missing_critical_fields %}<p class="hint">Missing: {{ bio.missing_critical_fields|join(', ') }}. Confidence is capped until these are in the source.</p>{% endif %}
+      {% endif %}
+      {% if report.source_correlations %}
+      <h3>Corroboration</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Entity</th><th>Layer</th><th class="num">Sources</th><th class="num">Official</th><th>Status</th></tr></thead>
+          <tbody>
+            {% for c in report.source_correlations %}
+            <tr><td>{{ c.entity }}</td><td>{{ c.layer }}</td><td class="num">{{ c.distinct_source_count }}</td><td class="num">{{ c.official_source_count }}</td><td>{{ c.corroboration_status|humanize }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </details>
+  </article>
+
+  <aside>
+    <h2>Review</h2>
+    <p class="hint">Reports stay in review until an analyst approves them.</p>
+    <form action="/forms/reports/{{ report.id }}/review" method="post" class="form">
+      <label>Status
+        <select name="status">
+          {% for value, label in [('needs_review', 'Needs review'), ('approved', 'Approved'), ('rejected', 'Rejected')] %}
+          <option value="{{ value }}" {% if report.review and report.review.status == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Reviewer <input name="reviewer" maxlength="120" value="{{ report.review.reviewer if report.review else '' }}"></label>
+      <label>Notes <textarea name="notes" rows="4" maxlength="1000">{{ report.review.notes if report.review else '' }}</textarea></label>
+      <button class="btn primary">Save review</button>
+    </form>
+    <form action="/forms/reports/{{ report.id }}/send-alert" method="post"><button class="btn small quiet">Send alert</button></form>
+  </aside>
+</div>
+{% endblock %}

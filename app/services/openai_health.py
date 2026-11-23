@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+import logging
+from typing import Any
 
 try:
     from openai import OpenAI
-except Exception:  
-    OpenAI = None  
+except ImportError:
+    OpenAI = None
 
 from app.config import settings
 from app.db import execute, row
-from app.services.openai_utils import openai_model_candidates, output_text as openai_output_text, response_usage as openai_response_usage
+from app.services.openai_utils import openai_model_candidates
+from app.services.openai_utils import output_text as openai_output_text
+from app.services.openai_utils import response_usage as openai_response_usage
+
+logger = logging.getLogger(__name__)
 
 HEALTH_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -55,28 +60,21 @@ def _record(status: dict[str, Any]) -> None:
             ),
         )
     except Exception:
-        
-        pass
+        logger.exception("Could not record OpenAI health check")
 
 
-def latest_openai_health() -> Optional[dict[str, Any]]:
+def latest_openai_health() -> dict[str, Any] | None:
     item = row("SELECT * FROM openai_health_checks ORDER BY id DESC LIMIT 1")
     if not item:
         return None
     try:
         item["raw"] = json.loads(item.get("raw_json") or "{}")
-    except Exception:
+    except (TypeError, ValueError):
         item["raw"] = {}
     return item
 
 
 def openai_status(run_live_test: bool = False) -> dict[str, Any]:
-    """Return configuration status and optionally perform a real low-token API check.
-
-    The live check sends a tiny structured-output request through the same OpenAI
-    SDK/Responses path the analyzer uses, proving that the key, model, SDK, and
-    response parsing work before the user spends tokens on a full biotech report.
-    """
     key_configured = bool(settings.openai_api_key)
     sdk_installed = OpenAI is not None
     base = {
@@ -97,17 +95,32 @@ def openai_status(run_live_test: bool = False) -> dict[str, Any]:
         "last_check": latest_openai_health(),
     }
     if not key_configured:
-        base.update({"status": "missing_key", "message": "OPENAI_API_KEY is not set. Add it to .env, then restart the app."})
+        base.update(
+            {"status": "missing_key", "message": "OPENAI_API_KEY is not set. Add it to .env, then restart the app."}
+        )
         return base
     if not sdk_installed:
-        base.update({"status": "sdk_missing", "message": "The openai Python package is not installed. Run pip install -r requirements.txt."})
+        base.update(
+            {
+                "status": "sdk_missing",
+                "message": "The openai Python package is not installed. Run pip install -r requirements.txt.",
+            }
+        )
         return base
     if not run_live_test:
-        base.update({"status": "configured", "message": "OPENAI_API_KEY is present. Run the live OpenAI test to verify the key/model. If the primary model is unavailable, the configured fallback list will be tried."})
+        base.update(
+            {
+                "status": "configured",
+                "message": (
+                    "OPENAI_API_KEY is present. Run the live OpenAI test to verify the key/model. If the "
+                    "primary model is unavailable, the configured fallback list will be tried."
+                ),
+            }
+        )
         return base
 
     try:
-        client = OpenAI(api_key=settings.openai_api_key)
+        client = OpenAI(api_key=settings.openai_api_key, timeout=60, max_retries=1)
         responses_api_available = hasattr(client, "responses")
         base["responses_api_available"] = responses_api_available
         if not responses_api_available:
@@ -144,7 +157,9 @@ def openai_status(run_live_test: bool = False) -> dict[str, Any]:
                         "configured_primary_model": settings.openai_healthcheck_model,
                         "model_candidates": openai_model_candidates(settings.openai_healthcheck_model),
                         "model_attempts": attempts,
-                        "message": "OpenAI API key, model, Responses API, and structured JSON parsing worked." if ok else "OpenAI responded, but not with the expected health-check JSON.",
+                        "message": "OpenAI API key, model, Responses API, and structured JSON parsing worked."
+                        if ok
+                        else "OpenAI responded, but not with the expected health-check JSON.",
                         "input_tokens": usage["input_tokens"],
                         "output_tokens": usage["output_tokens"],
                         "total_tokens": usage["total_tokens"],
@@ -159,11 +174,13 @@ def openai_status(run_live_test: bool = False) -> dict[str, Any]:
 
         raise last_exc or RuntimeError("OpenAI live test failed for all configured model candidates")
     except Exception as exc:
-        base.update({
-            "status": "failed",
-            "message": f"OpenAI live test failed: {exc}",
-            "model_candidates": openai_model_candidates(settings.openai_healthcheck_model),
-            "model_attempts": locals().get("attempts", []),
-        })
+        base.update(
+            {
+                "status": "failed",
+                "message": f"OpenAI live test failed: {exc}",
+                "model_candidates": openai_model_candidates(settings.openai_healthcheck_model),
+                "model_attempts": locals().get("attempts", []),
+            }
+        )
         _record(base)
         return base

@@ -1,63 +1,64 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ company.name }} — Catalyst Propagation Agent</title>
-  <link rel="stylesheet" href="/static/app.css" />
-</head>
-<body>
-  <header class="hero compact">
-    <div>
-      <a href="/" class="back">← Dashboard</a>
-      <p class="eyebrow">Watchlist company</p>
-      <h1>{{ company.name }} {% if company.ticker %}<span class="ticker">{{ company.ticker }}</span>{% endif %}</h1>
-      <p class="sub">{{ company.notes or 'No analyst notes saved yet.' }}</p>
-    </div>
-  </header>
-  <main class="layout">
-    <section class="grid three">
-      <article class="panel"><h2>Targets</h2><div class="tags big">{% for t in company.targets %}<span>{{ t }}</span>{% endfor %}</div></article>
-      <article class="panel"><h2>Indications</h2><div class="tags big">{% for i in company.indications %}<span>{{ i }}</span>{% endfor %}</div></article>
-      <article class="panel"><h2>Sources</h2>{% for url in company.source_urls %}<p><a href="{{ url }}" target="_blank" rel="noreferrer">{{ url }}</a></p>{% else %}<p class="empty">No official source URLs saved.</p>{% endfor %}</article>
-    </section>
+{% extends "base.html" %}
+{% block title %}{{ company.name }} · Catalyst Propagation{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <a class="back" href="/watchlist">Watchlist</a>
+    <h1>{{ company.name }}{% if company.ticker %} <span class="ticker">{{ company.ticker }}</span>{% endif %}</h1>
+    {% if company.notes %}<p class="lede">{{ company.notes }}</p>{% endif %}
+  </div>
+</div>
 
-    <section class="panel">
-      <h2>Peer read-through map</h2>
-      {% if company.peers %}
-      <div class="peer-grid">
-        {% for p in company.peers %}
-        <article class="peer-card">
-          <h3>{{ p.company or p.name }} {% if p.ticker %}<small>{{ p.ticker }}</small>{% endif %}</h3>
-          <p><span class="pill">{{ p.relationship }}</span></p>
-          <p class="muted"><strong>Target:</strong> {{ p.target or 'not listed' }}</p>
-          <p class="muted"><strong>Indication:</strong> {{ p.indication or 'not listed' }}</p>
-          <p>{{ p.expected_readthrough }}</p>
-        </article>
-        {% endfor %}
-      </div>
-      {% else %}<p class="empty">No peers saved.</p>{% endif %}
-    </section>
+<dl class="facts">
+  <div><dt>Targets</dt><dd>{{ company.targets|join(', ') or 'None listed' }}</dd></div>
+  <div><dt>Indications</dt><dd>{{ company.indications|join(', ') or 'None listed' }}</dd></div>
+  <div><dt>Aliases</dt><dd>{{ company.aliases|join(', ') or 'None listed' }}</dd></div>
+  <div><dt>Sources</dt><dd>
+    {% for url in company.source_urls %}<a href="{{ url|safe_url }}" target="_blank" rel="noopener noreferrer">{{ url }}</a><br>{% else %}None listed{% endfor %}
+  </dd></div>
+</dl>
 
-    <section class="panel">
-      <h2>Catalysts for {{ company.name }}</h2>
-      {% if catalysts %}
-      <div class="table-wrap"><table>
-        <thead><tr><th>Event</th><th>Type</th><th>Status</th><th>Direction</th><th>Report</th></tr></thead>
-        <tbody>
-          {% for cat in catalysts %}
-          <tr>
-            <td><strong>{{ cat.title }}</strong><br><small>{{ cat.created_at }}</small></td>
-            <td><span class="pill">{{ cat.event_type }}</span></td>
-            <td>{{ cat.status }}</td>
-            <td>{% if cat.overall_direction %}<span class="dir {{ cat.overall_direction }}">{{ cat.overall_direction }}</span> {{ '%.0f'|format(cat.overall_confidence * 100) }}%{% endif %}</td>
-            <td>{% if cat.report_id %}<a class="button-link" href="/report/{{ cat.report_id }}">Open</a>{% else %}<form action="/forms/catalysts/{{ cat.id }}/analyze" method="post"><button>Analyze</button></form>{% endif %}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table></div>
-      {% else %}<p class="empty">No catalysts saved for this company yet.</p>{% endif %}
-    </section>
-  </main>
-</body>
-</html>
+<h2>Peers</h2>
+{% if company.peers %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Company</th><th>Relationship</th><th>Target</th><th>Indication</th></tr></thead>
+    <tbody>
+      {% for p in company.peers %}
+      <tr>
+        <td>{{ p.company or p.name }}{% if p.ticker %} <span class="ticker">{{ p.ticker }}</span>{% endif %}</td>
+        <td>{{ p.relationship }}</td>
+        <td>{{ p.target or '—' }}</td>
+        <td>{{ p.indication or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}<p class="muted">No peers saved.</p>{% endif %}
+
+<h2>Catalysts</h2>
+{% if catalysts %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Event</th><th class="nowrap">Type</th><th class="nowrap">Read-through</th><th></th></tr></thead>
+    <tbody>
+      {% for cat in catalysts %}
+      <tr>
+        <td>
+          {% if cat.report_id %}<a href="/report/{{ cat.report_id }}">{{ cat.title }}</a>{% else %}{{ cat.title }}{% endif %}
+          <div class="sub">{{ (cat.event_date or cat.created_at or '')[:10] }}</div>
+        </td>
+        <td class="nowrap">{{ cat.event_type|humanize }}</td>
+        <td class="nowrap">
+          {% if cat.overall_direction %}<span class="dir {{ cat.overall_direction }}">{{ cat.overall_direction }}</span> <span class="num">{{ '%.0f'|format(cat.overall_confidence * 100) }}%</span>
+          {% else %}<span class="muted">{{ cat.status|humanize }}</span>{% endif %}
+        </td>
+        <td class="right">{% if not cat.report_id %}<form action="/forms/catalysts/{{ cat.id }}/analyze" method="post"><button class="btn small">Analyze</button></form>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}<p class="muted">No catalysts for {{ company.name }} yet.</p>{% endif %}
+{% endblock %}

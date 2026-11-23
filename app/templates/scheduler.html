@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Scheduler · Catalyst Propagation{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Scheduler</h1>
+    <p class="lede">Each company source gets a priority from catalyst timing, source reliability, past hits and cost. Sources that score high are checked first, and the model only runs once the cheap detector finds a likely catalyst.</p>
+  </div>
+  <div class="actions">
+    <form action="/forms/scheduler/tick" method="post"><button class="btn">Check due sources</button></form>
+    <form action="/forms/monitor" method="post"><button class="btn primary">Check all sources</button></form>
+  </div>
+</div>
+
+<dl class="counts">
+  <div><dt>Status</dt><dd>{{ scheduler.runtime_label }}</dd></div>
+  <div><dt>Sources</dt><dd>{{ scheduler.sources }}</dd></div>
+  <div><dt>Due now</dt><dd>{{ scheduler.due_count }}</dd></div>
+  <div><dt>AI spend today</dt><dd>${{ '%.3f'|format(scheduler.daily_budget_used) }} <span class="muted">of ${{ '%.2f'|format(scheduler.daily_budget) }}</span></dd></div>
+</dl>
+
+<h2>Source queue</h2>
+{% if scheduler.rows %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Company</th><th>Source</th><th class="num">Priority</th><th>Next check</th><th>Why</th></tr></thead>
+    <tbody>
+      {% for item in scheduler.rows %}
+      <tr>
+        <td><a href="/company/{{ item.company_id }}">{{ item.company_name }}</a>{% if item.ticker %} <span class="ticker">{{ item.ticker }}</span>{% endif %}</td>
+        <td>{{ item.source_name }}</td>
+        <td class="num"><span class="bar" style="--v: {{ (item.priority_score * 100)|round|int }}%"></span>{{ '%.2f'|format(item.priority_score) }}</td>
+        <td>{{ item.next_check_at[:16]|replace('T', ' ') if item.next_check_at else 'Not scheduled' }}</td>
+        <td class="reason">{{ item.reason }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="muted">No sources yet. Add companies to the <a href="/watchlist">watchlist</a>.</p>
+{% endif %}
+
+<h2>Recent runs</h2>
+{% if scheduler.recent_jobs or runs %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Started</th><th>Scope</th><th>Status</th><th class="num">New</th><th>Note</th></tr></thead>
+    <tbody>
+      {% for job in scheduler.recent_jobs %}
+      <tr>
+        <td>{{ job.started_at[:16]|replace('T', ' ') if job.started_at else '' }}</td>
+        <td>{{ job.company_name }}, {{ job.source_name }}</td>
+        <td>{{ job.status }}</td>
+        <td class="num">{{ job.new_catalysts }}</td>
+        <td class="reason">{{ job.message or '' }}</td>
+      </tr>
+      {% endfor %}
+      {% for run in runs %}
+      <tr>
+        <td>{{ run.started_at[:16]|replace('T', ' ') if run.started_at else '' }}</td>
+        <td>Full monitor</td>
+        <td>{{ run.status }}</td>
+        <td class="num">{{ run.new_catalysts }}</td>
+        <td class="reason">{{ run.message or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="muted">Nothing has run yet.</p>
+{% endif %}
+{% endblock %}

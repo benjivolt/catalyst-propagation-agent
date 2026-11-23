@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Add catalyst · Catalyst Propagation{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Add catalyst</h1>
+    <p class="lede">Paste a press release, FDA notice or filing excerpt. The report cites what you paste, so include the key paragraphs.</p>
+  </div>
+</div>
+
+{% if companies %}
+<form action="/forms/manual-catalyst" method="post" class="form">
+  <label>Company
+    <select name="company_id" required>
+      {% for company in companies %}
+      <option value="{{ company.id }}">{{ company.name }}{% if company.ticker %} ({{ company.ticker }}){% endif %}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Headline <input name="title" required maxlength="300" placeholder="Madrigal reports Phase 3 MAESTRO-NASH results"></label>
+  <div class="row">
+    <label>Source URL <input name="url" type="url" placeholder="https://"></label>
+    <label>Publisher <input name="publisher" maxlength="120" placeholder="Company press release"></label>
+  </div>
+  <div class="row">
+    <label>Date <input name="event_date" type="date"></label>
+    <label>Event type
+      <select name="event_type">
+        <option value="">Detect automatically</option>
+        <option value="trial_readout">Trial readout</option>
+        <option value="fda_decision">FDA decision</option>
+        <option value="licensing_deal">Licensing deal</option>
+        <option value="acquisition">Acquisition</option>
+        <option value="other_catalyst">Other</option>
+      </select>
+    </label>
+  </div>
+  <label>Source text <textarea name="excerpt" rows="10" required maxlength="20000"></textarea></label>
+  <div class="actions"><button class="btn primary">Create report</button></div>
+</form>
+{% else %}
+<section class="empty">
+  <h2>Add a company first</h2>
+  <p>Catalysts belong to a watchlist company.</p>
+  <div class="actions"><a class="btn primary" href="/watchlist/new">Add company</a></div>
+</section>
+{% endif %}
+{% endblock %}

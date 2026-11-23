@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from app.db import execute, row, rows
-from app.services.monitor import analyze_and_save, create_company, get_companies, seed_examples
+from app.services.monitor import analyze_and_save, get_companies, seed_examples
 from app.services.peer_graph import sync_all_peer_relationships
 from app.services.source_verifier import verify_sources_for_catalyst
 from app.services.utils import clean_text, source_key
@@ -27,16 +27,19 @@ def _ensure_seed_company(ticker: str) -> int:
     return int(company["id"])
 
 
-def _insert_curated_catalyst(company_id: int, event_type: str, title: str, summary: str, event_date: str, source_docs: list[dict[str, Any]]) -> int:
+def _insert_curated_catalyst(
+    company_id: int, event_type: str, title: str, summary: str, event_date: str, source_docs: list[dict[str, Any]]
+) -> int:
     cluster = source_key(str(company_id), event_type, event_date, title[:180])
-    key = source_key(str(company_id), "masterpiece_demo", title, event_date)
+    key = source_key(str(company_id), "demo", title, event_date)
     existing = row("SELECT id FROM catalysts WHERE source_key = ?", (key,))
     if existing:
         catalyst_id = int(existing["id"])
     else:
         catalyst_id = execute(
             """
-            INSERT INTO catalysts (company_id, event_type, title, summary, event_date, source_key, event_cluster_key, raw_json)
+            INSERT INTO catalysts (company_id, event_type, title, summary, event_date, source_key, event_cluster_key,
+                raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -47,7 +50,7 @@ def _insert_curated_catalyst(company_id: int, event_type: str, title: str, summa
                 event_date,
                 key,
                 cluster,
-                json.dumps({"curated_demo": True, "purpose": "masterpiece_showcase"}, ensure_ascii=False),
+                json.dumps({"curated_demo": True, "purpose": "demo_reports"}, ensure_ascii=False),
             ),
         )
     for doc in source_docs:
@@ -73,16 +76,7 @@ def _insert_curated_catalyst(company_id: int, event_type: str, title: str, summa
     return catalyst_id
 
 
-def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
-    """Create a high-quality, official-source demo set for graders.
-
-    These examples are intentionally based on official FDA/company URLs and
-    specific peer evidence already stored in the watchlist. They let a reviewer
-    open real reports immediately without waiting for a new biotech catalyst to
-    happen in the live market.
-    """
-    
-    
+def seed_demo_reports(auto_analyze: bool = True) -> dict[str, Any]:
     seed_examples(force=True)
     sync_all_peer_relationships()
     created: list[dict[str, Any]] = []
@@ -91,8 +85,10 @@ def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
     mdgl_catalyst = _insert_curated_catalyst(
         mdgl_id,
         "fda_decision",
-        "FDA approves Rezdiffra/resmetirom as the first treatment for adults with noncirrhotic NASH/MASH with moderate to advanced fibrosis",
-        "FDA approval of Rezdiffra/resmetirom creates a high-quality regulatory catalyst for THR-beta biology, the MASH treatment landscape, and same-indication peers.",
+        "FDA approves Rezdiffra/resmetirom as the first treatment for adults with noncirrhotic "
+        "NASH/MASH with moderate to advanced fibrosis",
+        "FDA approval of Rezdiffra/resmetirom is a well-documented regulatory catalyst for THR-beta "
+        "biology, the MASH treatment landscape, and same-indication peers.",
         "2024-03-14",
         [
             {
@@ -101,7 +97,12 @@ def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
                 "publisher": "U.S. Food and Drug Administration",
                 "published_at": "2024-03-14",
                 "source_type": "fda_press_announcements",
-                "excerpt": "FDA approved Rezdiffra (resmetirom) for adults with noncirrhotic NASH with moderate to advanced liver fibrosis, to be used with diet and exercise. The FDA page also describes Rezdiffra as a partial activator of the thyroid hormone receptor and notes accelerated approval based on surrogate endpoints from a randomized placebo-controlled trial.",
+                "excerpt": (
+                    "FDA approved Rezdiffra (resmetirom) for adults with noncirrhotic NASH with moderate to "
+                    "advanced liver fibrosis, to be used with diet and exercise. The FDA page also describes "
+                    "Rezdiffra as a partial activator of the thyroid hormone receptor and notes accelerated "
+                    "approval based on surrogate endpoints from a randomized placebo-controlled trial."
+                ),
             }
         ],
     )
@@ -112,7 +113,8 @@ def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
         crsp_id,
         "fda_decision",
         "FDA approves CASGEVY/exa-cel, a CRISPR/Cas9 cell therapy, for sickle cell disease",
-        "FDA approval of CASGEVY/exa-cel is a high-impact regulatory catalyst for CRISPR/Cas9 editing, sickle cell disease, and curative gene-therapy competitors/partners.",
+        "FDA approval of CASGEVY/exa-cel is a high-impact regulatory catalyst for CRISPR/Cas9 "
+        "editing, sickle cell disease, and curative gene-therapy competitors/partners.",
         "2023-12-08",
         [
             {
@@ -121,7 +123,12 @@ def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
                 "publisher": "U.S. Food and Drug Administration",
                 "published_at": "2023-12-08",
                 "source_type": "fda_press_announcements",
-                "excerpt": "FDA approved Casgevy and Lyfgenia as cell-based gene therapies for sickle cell disease patients age 12 and older. FDA describes Casgevy as the first FDA-approved therapy using CRISPR/Cas9 genome-editing technology, with modified blood stem cells intended to raise fetal hemoglobin.",
+                "excerpt": (
+                    "FDA approved Casgevy and Lyfgenia as cell-based gene therapies for sickle cell disease "
+                    "patients age 12 and older. FDA describes Casgevy as the first FDA-approved therapy using "
+                    "CRISPR/Cas9 genome-editing technology, with modified blood stem cells intended to raise "
+                    "fetal hemoglobin."
+                ),
             },
             {
                 "title": "FDA CASGEVY product page evidence",
@@ -129,7 +136,11 @@ def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
                 "publisher": "U.S. Food and Drug Administration",
                 "published_at": None,
                 "source_type": "fda_press_announcements",
-                "excerpt": "FDA lists CASGEVY, proper name exagamglogene autotemcel (exa-cel), manufactured by Vertex Pharmaceuticals, with indications for sickle cell disease and transfusion-dependent beta thalassemia in patients 12 years of age and older.",
+                "excerpt": (
+                    "FDA lists CASGEVY, proper name exagamglogene autotemcel (exa-cel), manufactured by Vertex "
+                    "Pharmaceuticals, with indications for sickle cell disease and transfusion-dependent beta "
+                    "thalassemia in patients 12 years of age and older."
+                ),
             },
             {
                 "title": "FDA LYFGENIA product page evidence for sickle-cell competitive context",
@@ -137,7 +148,11 @@ def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
                 "publisher": "U.S. Food and Drug Administration",
                 "published_at": None,
                 "source_type": "fda_press_announcements",
-                "excerpt": "FDA lists LYFGENIA/lovotibeglogene autotemcel from bluebird bio as a gene therapy for sickle cell disease patients 12 years of age or older with a history of vaso-occlusive events, creating same-indication competitive context for CASGEVY.",
+                "excerpt": (
+                    "FDA lists LYFGENIA/lovotibeglogene autotemcel from bluebird bio as a gene therapy for "
+                    "sickle cell disease patients 12 years of age or older with a history of vaso-occlusive "
+                    "events, creating same-indication competitive context for CASGEVY."
+                ),
             },
         ],
     )
@@ -148,7 +163,8 @@ def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
         argx_id,
         "fda_decision",
         "UCB receives U.S. FDA approval for RYSTIGGO/rozanolixizumab-noli in generalized myasthenia gravis",
-        "The RYSTIGGO approval provides a same-target/same-indication FcRn comparator catalyst for argenx/Vyvgart and other FcRn peers, with both class-validation and competition effects.",
+        "The RYSTIGGO approval provides a same-target/same-indication FcRn comparator catalyst for "
+        "argenx/Vyvgart and other FcRn peers, with both class-validation and competition effects.",
         "2023-06-27",
         [
             {
@@ -157,7 +173,12 @@ def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
                 "publisher": "UCB",
                 "published_at": "2023-06-27",
                 "source_type": "company_news",
-                "excerpt": "UCB announced U.S. FDA approval of RYSTIGGO (rozanolixizumab-noli) for adults with generalized myasthenia gravis who are anti-AChR or anti-MuSK antibody positive. UCB describes rozanolixizumab-noli as an antibody that binds the neonatal Fc receptor (FcRn), reducing circulating IgG.",
+                "excerpt": (
+                    "UCB announced U.S. FDA approval of RYSTIGGO (rozanolixizumab-noli) for adults with "
+                    "generalized myasthenia gravis who are anti-AChR or anti-MuSK antibody positive. UCB "
+                    "describes rozanolixizumab-noli as an antibody that binds the neonatal Fc receptor (FcRn), "
+                    "reducing circulating IgG."
+                ),
             }
         ],
     )
@@ -176,7 +197,9 @@ def seed_masterpiece_showcase(auto_analyze: bool = True) -> dict[str, Any]:
         "curated_catalysts": len(created),
         "catalyst_ids": [int(x["catalyst_id"]) for x in created],
         "report_ids": reports,
-        "message": "Created official-source showcase catalysts and analyzed reports." if auto_analyze else "Created official-source showcase catalysts.",
+        "message": "Created official-source showcase catalysts and analyzed reports."
+        if auto_analyze
+        else "Created official-source showcase catalysts.",
     }
 
 
@@ -190,8 +213,14 @@ def demo_readiness_summary() -> dict[str, Any]:
         """
     )
     review = rows("SELECT status, COUNT(*) AS count FROM report_reviews GROUP BY status ORDER BY status")
-    source_status = rows("SELECT verification_status, COUNT(*) AS count FROM source_docs GROUP BY verification_status ORDER BY count DESC")
-    llm = rows("SELECT status, model, COUNT(*) AS count, SUM(total_tokens) AS tokens FROM llm_usage GROUP BY status, model ORDER BY id DESC LIMIT 10")
+    source_status = rows(
+        "SELECT verification_status, COUNT(*) AS count FROM source_docs GROUP BY "
+        "verification_status ORDER BY count DESC"
+    )
+    llm = rows(
+        "SELECT status, model, COUNT(*) AS count, SUM(total_tokens) AS tokens FROM llm_usage GROUP "
+        "BY status, model ORDER BY id DESC LIMIT 10"
+    )
     return {
         "companies": len(rows("SELECT id FROM companies")),
         "catalysts": len(rows("SELECT id FROM catalysts")),

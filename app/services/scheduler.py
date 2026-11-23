@@ -2,19 +2,36 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
+import re
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime, timedelta
+from functools import partial
+from typing import Any
 
 from app.config import settings
 from app.db import execute, row, rows
-from app.services.sources import SourceDocumentCandidate, SourceFetchError, all_sources
-from app.services.utils import CATALYST_KEYWORDS, classify_catalyst, clean_text, detect_catalyst, is_likely_catalyst, source_key
-from app.services.reliability import content_fingerprint, record_source_health, run_with_retries, should_skip_stale_candidate
 from app.services.ai_candidate_reviewer import review_candidate, save_candidate_review
+from app.services.budget import daily_spend
+from app.services.detection import SIGNALS
 from app.services.outcome_learning import learned_threshold, reputation_score
+from app.services.reliability import (
+    content_fingerprint,
+    record_source_health,
+    run_with_retries,
+    should_skip_stale_candidate,
+)
+from app.services.sources import SourceDocumentCandidate, SourceFetchError, all_sources
+from app.services.utils import (
+    clean_text,
+    detect_catalyst,
+    humanize,
+    source_key,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -37,39 +54,59 @@ SOURCE_PROFILES: dict[str, SourceProfile] = {
 }
 
 HIGH_IMPACT_TERMS = (
-    "pdufa", "fda", "approval", "complete response letter", "crl", "phase 3",
-    "pivotal", "topline", "readout", "primary endpoint", "clinical hold",
-    "acquisition", "merger", "licensing", "license agreement", "data expected",
+    "pdufa",
+    "fda",
+    "approval",
+    "complete response letter",
+    "crl",
+    "phase 3",
+    "pivotal",
+    "topline",
+    "readout",
+    "primary endpoint",
+    "clinical hold",
+    "acquisition",
+    "merger",
+    "licensing",
+    "license agreement",
+    "data expected",
 )
-OFFICIAL_SOURCE_NAMES = {"sec_edgar", "fda_press_announcements", "clinicaltrials_gov", "openfda_drugs", "pubmed", "company_news"}
+OFFICIAL_SOURCE_NAMES = {
+    "sec_edgar",
+    "fda_press_announcements",
+    "clinicaltrials_gov",
+    "openfda_drugs",
+    "pubmed",
+    "company_news",
+}
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime.now(UTC).replace(microsecond=0)
 
 
 def _iso(dt: datetime) -> str:
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).replace(microsecond=0).isoformat()
 
 
-def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
     raw = str(value).strip()
     if not raw:
         return None
-    
+
     candidates = [raw, raw.replace("Z", "+00:00"), raw.replace(" ", "T")]
     for candidate in candidates:
         try:
             if len(candidate) == 10 and candidate.count("-") == 2:
-                return datetime.fromisoformat(candidate).replace(tzinfo=timezone.utc)
+                return datetime.fromisoformat(candidate).replace(tzinfo=UTC)
             dt = datetime.fromisoformat(candidate)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
+                dt = dt.replace(tzinfo=UTC)
+            return dt.astimezone(UTC)
         except ValueError:
             continue
     return None
@@ -90,7 +127,7 @@ def _json_loads(value: Any, default: Any) -> Any:
         return value
     try:
         return json.loads(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
@@ -103,7 +140,6 @@ def _profile_for(source_name: str) -> SourceProfile:
 
 
 def company_context_score(company: dict[str, Any]) -> float:
-    """Estimate how important/near-term the company appears from watchlist context."""
     text = " ".join(
         [
             str(company.get("name", "")),
@@ -125,8 +161,7 @@ def company_context_score(company: dict[str, Any]) -> float:
     return _clip(score, 0.15, 0.95)
 
 
-def catalyst_window_score(company: dict[str, Any], today: Optional[datetime] = None) -> float:
-    """Lightweight hazard/window score from explicit dates and biotech guidance language."""
+def catalyst_window_score(company: dict[str, Any], today: datetime | None = None) -> float:
     today = today or _now()
     text = " ".join(
         [
@@ -143,7 +178,6 @@ def catalyst_window_score(company: dict[str, Any], today: Optional[datetime] = N
     if any(term in text for term in ("acquisition", "merger", "license agreement", "collaboration")):
         score += 0.12
 
-    
     for token in set(__import__("re").findall(r"\b20\d{2}-\d{2}-\d{2}\b", text)):
         dt = _parse_dt(token)
         if not dt:
@@ -158,15 +192,16 @@ def catalyst_window_score(company: dict[str, Any], today: Optional[datetime] = N
         elif days <= 90:
             score += 0.08
 
-    
     for q, year in __import__("re").findall(r"\bq([1-4])\s*(20\d{2})\b", text):
         qn = int(q)
         yr = int(year)
         start_month = 1 + (qn - 1) * 3
-        start = datetime(yr, start_month, 1, tzinfo=timezone.utc)
+        start = datetime(yr, start_month, 1, tzinfo=UTC)
         end_month = start_month + 2
-        
-        next_month = datetime(yr + (1 if end_month == 12 else 0), 1 if end_month == 12 else end_month + 1, 1, tzinfo=timezone.utc)
+
+        next_month = datetime(
+            yr + (1 if end_month == 12 else 0), 1 if end_month == 12 else end_month + 1, 1, tzinfo=UTC
+        )
         end = next_month - timedelta(days=1)
         if start <= today <= end:
             elapsed = max((today - start).days, 0)
@@ -195,7 +230,6 @@ def _company_from_state_row(r: dict[str, Any]) -> dict[str, Any]:
 
 
 def sync_scheduler_state() -> None:
-    """Create one adaptive state row per active company/source pair."""
     companies = rows("SELECT * FROM companies WHERE active = 1")
     source_names = list(_source_instances().keys())
     now = _iso(_now())
@@ -248,7 +282,9 @@ def _scheduler_rows() -> list[dict[str, Any]]:
     )
 
 
-def calculate_priority(company: dict[str, Any], state: dict[str, Any], total_checks: Optional[int] = None) -> tuple[float, str]:
+def calculate_priority(
+    company: dict[str, Any], state: dict[str, Any], total_checks: int | None = None
+) -> tuple[float, str]:
     source_name = str(state.get("source_name") or "")
     profile = _profile_for(source_name)
     learned_rep = reputation_score(source_name, "all", int(state.get("company_id") or 0) or None)
@@ -322,7 +358,7 @@ def calculate_next_check_at(priority: float, state: dict[str, Any]) -> str:
     backoff = int(state.get("backoff_level") or 0)
     minutes *= min(1.0 + 0.18 * backoff, 3.5)
     minutes = max(min_minutes, min(max_minutes, minutes))
-    
+
     jitter = int(_hash_text(f"{state.get('id')}:{source_name}")[:2], 16) % 7
     return _iso(_now() + timedelta(minutes=minutes + jitter))
 
@@ -330,12 +366,14 @@ def calculate_next_check_at(priority: float, state: dict[str, Any]) -> str:
 def refresh_priorities() -> list[dict[str, Any]]:
     sync_scheduler_state()
     states = _scheduler_rows()
-    total_checks = int((row("SELECT COALESCE(SUM(checks_count), 0) AS n FROM scheduler_source_state") or {"n": 1})["n"] or 1)
+    total_checks = int(
+        (row("SELECT COALESCE(SUM(checks_count), 0) AS n FROM scheduler_source_state") or {"n": 1})["n"] or 1
+    )
     refreshed: list[dict[str, Any]] = []
     for state in states:
         company = _company_from_state_row(state)
         priority, reason = calculate_priority(company, state, total_checks=total_checks)
-        
+
         execute(
             """
             UPDATE scheduler_source_state
@@ -355,22 +393,20 @@ def _candidate_text(candidate: SourceDocumentCandidate) -> str:
     return f"{candidate.title} {candidate.publisher} {candidate.excerpt} {candidate.url}".lower()
 
 
-def score_candidate(company: dict[str, Any], candidate: SourceDocumentCandidate, state: dict[str, Any]) -> tuple[float, list[str]]:
+def score_candidate(
+    company: dict[str, Any], candidate: SourceDocumentCandidate, state: dict[str, Any]
+) -> tuple[float, list[str]]:
     text = _candidate_text(candidate)
     source_name = str(state.get("source_name") or candidate.source_type)
     profile = _profile_for(source_name)
     detection = detect_catalyst(candidate.title, candidate.excerpt)
     event_type = detection.event_type
-    # Calibrated detection confidence drives the gate instead of a flat 0.44, so a
-    # decisive readout outscores a marginal hint, and a forward-looking
-    # announcement ("plans to report topline in Q4") is penalized rather than
-    # treated as a fired catalyst.
     event_score = 0.12 + 0.46 * detection.confidence
     if detection.is_forward_looking:
         event_score -= 0.12
     keyword_hits = 0
-    for words in CATALYST_KEYWORDS.values():
-        keyword_hits += sum(1 for word in words if word in text)
+    for patterns in SIGNALS.values():
+        keyword_hits += sum(1 for pattern, _ in patterns if re.search(pattern, text))
     event_score += min(keyword_hits * 0.02, 0.12)
 
     terms = [company.get("name", ""), company.get("ticker", ""), *(company.get("aliases") or [])]
@@ -384,26 +420,22 @@ def score_candidate(company: dict[str, Any], candidate: SourceDocumentCandidate,
     try:
         duplicate = row("SELECT id FROM catalysts WHERE source_key = ?", (candidate_key,)) is not None
     except Exception:
-        
-        
-        
         duplicate = False
     novelty = 0.0 if duplicate else 0.12
-    learned_reputation = reputation_score(source_name, event_type, int(company.get("id") or 0) or None, candidate.publisher, candidate.url)
-    blended_reliability = (0.45 * float(state.get("reliability_score") or profile.reliability)) + (0.55 * learned_reputation)
+    learned_reputation = reputation_score(
+        source_name, event_type, int(company.get("id") or 0) or None, candidate.publisher, candidate.url
+    )
+    blended_reliability = (0.45 * float(state.get("reliability_score") or profile.reliability)) + (
+        0.55 * learned_reputation
+    )
     source_score = 0.20 * blended_reliability
 
     raw_score = event_score + company_score + target_score + novelty + source_score - (0.18 if duplicate else 0.0)
-    # Event-presence cap: company/target relevance must not, on its own, push a
-    # non-event past the promote threshold. A candidate can only score high when a
-    # catalyst was actually detected. Forward-looking items (already discounted to
-    # low confidence) are capped just under the default promote threshold so they
-    # are watched, not promoted.
     event_cap = 0.45 + 0.55 * detection.confidence
     score = _clip(min(raw_score, event_cap))
     reasons: list[str] = []
     if event_type != "other_catalyst":
-        reasons.append(f"{event_type} (detection conf {detection.confidence:.2f})")
+        reasons.append(f"{humanize(event_type)} (detection confidence {detection.confidence:.2f})")
     if detection.is_forward_looking:
         reasons.append("forward-looking announcement (penalized)")
     if raw_score > event_cap + 1e-9:
@@ -423,15 +455,11 @@ def score_candidate(company: dict[str, Any], candidate: SourceDocumentCandidate,
 
 
 def _fingerprint_candidates(candidates: list[SourceDocumentCandidate]) -> str:
-    
-    
     return content_fingerprint(candidates)
 
 
 def _daily_spend() -> float:
-    start = _iso(_now().replace(hour=0, minute=0, second=0, microsecond=0))
-    result = row("SELECT COALESCE(SUM(estimated_cost), 0) AS spent FROM budget_ledger WHERE created_at >= ?", (start,))
-    return float(result.get("spent", 0.0) if result else 0.0)
+    return daily_spend()
 
 
 def _budget_allows(estimated_cost: float) -> bool:
@@ -441,17 +469,37 @@ def _budget_allows(estimated_cost: float) -> bool:
     return (_daily_spend() + estimated_cost) <= budget
 
 
-def _record_budget(run_id: Optional[int], job_id: Optional[int], company_id: Optional[int], source_name: str, amount: float, reason: str, model: str = "none", input_tokens: int = 0, output_tokens: int = 0) -> None:
+def _record_budget(
+    run_id: int | None,
+    job_id: int | None,
+    company_id: int | None,
+    source_name: str,
+    amount: float,
+    reason: str,
+    model: str = "none",
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> None:
     execute(
         """
-        INSERT INTO budget_ledger (run_id, job_id, company_id, source_name, model, input_tokens, output_tokens, estimated_cost, reason)
+        INSERT INTO budget_ledger (run_id, job_id, company_id, source_name, model, input_tokens, output_tokens,
+            estimated_cost, reason)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (run_id, job_id, company_id, source_name, model, input_tokens, output_tokens, float(amount), reason),
     )
 
 
-def _update_state_after_job(state: dict[str, Any], reward: float, changed: bool, found_catalyst: bool, duplicate_count: int, false_positive_count: int, cost: float, reason: str) -> None:
+def _update_state_after_job(
+    state: dict[str, Any],
+    reward: float,
+    changed: bool,
+    found_catalyst: bool,
+    duplicate_count: int,
+    false_positive_count: int,
+    cost: float,
+    reason: str,
+) -> None:
     checks = int(state.get("checks_count") or 0)
     current_avg = float(state.get("average_reward") or 0.0)
     new_avg = ((current_avg * checks) + reward) / (checks + 1)
@@ -498,12 +546,9 @@ def _update_state_after_job(state: dict[str, Any], reward: float, changed: bool,
     )
 
 
-def run_adaptive_monitor(auto_analyze: bool = True, per_source_limit: int = 4, due_only: bool = False, max_jobs: Optional[int] = None) -> dict[str, Any]:
-    """Run the cost-aware adaptive scheduler once.
-
-    due_only=False is used by the dashboard button so the user can force an immediate pass.
-    due_only=True is used by the background scheduler so quiet sources wait for next_check_at.
-    """
+def run_adaptive_monitor(
+    auto_analyze: bool = True, per_source_limit: int = 4, due_only: bool = False, max_jobs: int | None = None
+) -> dict[str, Any]:
     run_id = execute("INSERT INTO monitor_runs (status, message) VALUES ('running', 'adaptive scheduler started')")
     errors: list[str] = []
     new_catalyst_ids: list[int] = []
@@ -537,7 +582,11 @@ def run_adaptive_monitor(auto_analyze: bool = True, per_source_limit: int = 4, d
                     SET next_check_at = ?, reason = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (_iso(_now() + timedelta(hours=1)), "Skipped: daily adaptive scheduler budget would be exceeded.", state["id"]),
+                    (
+                        _iso(_now() + timedelta(hours=1)),
+                        "Skipped: this check would exceed the daily budget.",
+                        state["id"],
+                    ),
                 )
                 continue
 
@@ -546,7 +595,14 @@ def run_adaptive_monitor(auto_analyze: bool = True, per_source_limit: int = 4, d
                 INSERT INTO scheduler_jobs (run_id, state_id, company_id, source_name, scheduled_for, priority_score)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, state["id"], company["id"], source_name, state.get("next_check_at"), float(state.get("priority_score") or 0.0)),
+                (
+                    run_id,
+                    state["id"],
+                    company["id"],
+                    source_name,
+                    state.get("next_check_at"),
+                    float(state.get("priority_score") or 0.0),
+                ),
             )
             jobs_started += 1
             _record_budget(run_id, job_id, company["id"], source_name, estimated_cost, "source_check")
@@ -558,22 +614,28 @@ def run_adaptive_monitor(auto_analyze: bool = True, per_source_limit: int = 4, d
             false_positive_count = 0
             changed = False
             reward = -1.0
-            message = "no candidates"
+            message = "No candidates"
             try:
-                started_perf = datetime.now(timezone.utc)
+                started_perf = datetime.now(UTC)
                 fetched, health = run_with_retries(
                     source_name,
-                    lambda: source.fetch(company, limit=per_source_limit),
+                    partial(source.fetch, company, limit=per_source_limit),
                     attempts=max(int(settings.source_fetch_retries), 1),
                     base_sleep=max(float(settings.source_retry_base_sleep_seconds), 0.0),
                 )
-                latency_ms = int((datetime.now(timezone.utc) - started_perf).total_seconds() * 1000)
+                latency_ms = int((datetime.now(UTC) - started_perf).total_seconds() * 1000)
                 if fetched is None:
                     error_text = "; ".join(health.get("errors") or []) or "source fetch failed"
-                    record_source_health(company["id"], source_name, "failed", latency_ms=latency_ms, candidate_count=0, error=error_text)
-                    raise SourceFetchError(f"{source_name} failed after {health.get('attempts')} attempts: {error_text}")
+                    record_source_health(
+                        company["id"], source_name, "failed", latency_ms=latency_ms, candidate_count=0, error=error_text
+                    )
+                    raise SourceFetchError(
+                        f"{source_name} failed after {health.get('attempts')} attempts: {error_text}"
+                    )
                 candidates = [c for c in fetched if not should_skip_stale_candidate(c, state)]
-                record_source_health(company["id"], source_name, "ok", latency_ms=latency_ms, candidate_count=len(candidates))
+                record_source_health(
+                    company["id"], source_name, "ok", latency_ms=latency_ms, candidate_count=len(candidates)
+                )
                 fingerprint = _fingerprint_candidates(candidates)
                 previous_hash = state.get("last_hash")
                 changed = bool(candidates) and fingerprint != previous_hash
@@ -601,17 +663,25 @@ def run_adaptive_monitor(auto_analyze: bool = True, per_source_limit: int = 4, d
                     prediction_id = save_candidate_review(company, candidate, review, gate_score=candidate_score)
                     policy = learned_threshold(source_name, review.event_type, int(company.get("id") or 0) or None)
                     promote_threshold = float(policy.get("promote_threshold") or settings.scheduler_candidate_threshold)
-                    if review.decision != "promote_to_catalyst" or candidate_score < min(promote_threshold, float(settings.scheduler_candidate_threshold)):
+                    if review.decision != "promote_to_catalyst" or candidate_score < min(
+                        promote_threshold, float(settings.scheduler_candidate_threshold)
+                    ):
                         low_score_count += 1
                         if review.decision in {"reject_irrelevant", "needs_ai_review"}:
                             false_positive_count += 1
-                        message = f"candidate stored as {review.decision}; prediction {prediction_id}; score {candidate_score:.2f}; threshold {promote_threshold:.2f}; {review.reasoning_summary[:240]}"
+                        message = (
+                            f"Held as {humanize(review.decision)} (prediction {prediction_id}, "
+                            f"score {candidate_score:.2f}, threshold {promote_threshold:.2f}). "
+                            f"{review.reasoning_summary[:240]}"
+                        )
                         continue
-                    from app.services.monitor import _save_candidate_as_catalyst, analyze_and_save  
+                    from app.services.monitor import _save_candidate_as_catalyst, analyze_and_save
 
                     catalyst_id = _save_candidate_as_catalyst(company["id"], candidate)
                     if catalyst_id:
-                        save_candidate_review(company, candidate, review, gate_score=candidate_score, catalyst_id=catalyst_id)
+                        save_candidate_review(
+                            company, candidate, review, gate_score=candidate_score, catalyst_id=catalyst_id
+                        )
                         new_count += 1
                         new_catalyst_ids.append(catalyst_id)
                         should_analyze = auto_analyze and (
@@ -631,22 +701,30 @@ def run_adaptive_monitor(auto_analyze: bool = True, per_source_limit: int = 4, d
                                 1800 if settings.openai_api_key else 0,
                                 900 if settings.openai_api_key else 0,
                             )
-                            message = f"created catalyst {catalyst_id} and report {report_id}; prediction {prediction_id}; score {candidate_score:.2f}; {', '.join(score_reasons)}"
+                            message = (
+                                f"Created catalyst {catalyst_id} and report {report_id} "
+                                f"(prediction {prediction_id}, score {candidate_score:.2f}): "
+                                f"{', '.join(score_reasons)}"
+                            )
                         else:
-                            message = f"created catalyst {catalyst_id}; LLM gated to save tokens; prediction {prediction_id}; score {candidate_score:.2f}; {', '.join(score_reasons)}"
+                            message = (
+                                f"Created catalyst {catalyst_id}; score {candidate_score:.2f} is below the LLM "
+                                f"threshold, so no report yet (prediction {prediction_id}): "
+                                f"{', '.join(score_reasons)}"
+                            )
 
                 if new_count:
                     reward = 10.0 + min(new_count - 1, 3)
                     message = message or f"{new_count} new catalysts"
                 elif candidates and duplicate_count == len(candidates):
                     reward = -3.0
-                    message = "all candidates were duplicates"
+                    message = "All candidates were duplicates"
                 elif candidates and low_score_count:
                     reward = -4.0
-                    message = f"{low_score_count} low-score candidates blocked before LLM"
+                    message = f"{low_score_count} low-score candidates stopped before the LLM"
                 elif candidates:
                     reward = 1.0
-                    message = f"{len(candidates)} changed candidates but no new catalyst"
+                    message = f"{len(candidates)} changed candidates, no new catalyst"
 
                 execute(
                     """
@@ -655,18 +733,36 @@ def run_adaptive_monitor(auto_analyze: bool = True, per_source_limit: int = 4, d
                         new_catalysts = ?, duplicates = ?, skipped_low_score = ?, reward_value = ?, message = ?
                     WHERE id = ?
                     """,
-                    (len(candidates), new_count, duplicate_count, low_score_count, reward, clean_text(message, 1000), job_id),
+                    (
+                        len(candidates),
+                        new_count,
+                        duplicate_count,
+                        low_score_count,
+                        reward,
+                        clean_text(message, 1000),
+                        job_id,
+                    ),
                 )
                 execute(
                     "INSERT INTO scheduler_rewards (state_id, job_id, reward_value, reward_reason) VALUES (?, ?, ?, ?)",
                     (state["id"], job_id, reward, clean_text(message, 500)),
                 )
-                _update_state_after_job(state, reward, changed, new_count > 0, duplicate_count, false_positive_count, estimated_cost, clean_text(message, 500))
+                _update_state_after_job(
+                    state,
+                    reward,
+                    changed,
+                    new_count > 0,
+                    duplicate_count,
+                    false_positive_count,
+                    estimated_cost,
+                    clean_text(message, 500),
+                )
             except SourceFetchError as exc:
                 reward = -2.0
                 errors.append(str(exc))
                 execute(
-                    "UPDATE scheduler_jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, reward_value = ?, message = ? WHERE id = ?",
+                    "UPDATE scheduler_jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, "
+                    "reward_value = ?, message = ? WHERE id = ?",
                     (reward, str(exc), job_id),
                 )
                 execute(
@@ -674,24 +770,26 @@ def run_adaptive_monitor(auto_analyze: bool = True, per_source_limit: int = 4, d
                     (state["id"], job_id, reward, str(exc)),
                 )
                 _update_state_after_job(state, reward, False, False, 0, 0, estimated_cost, f"Fetch error: {exc}")
-            except Exception as exc:  
+            except Exception as exc:
                 reward = -4.0
                 errors.append(f"{source_name} unexpected error: {exc}")
                 execute(
-                    "UPDATE scheduler_jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, reward_value = ?, message = ? WHERE id = ?",
+                    "UPDATE scheduler_jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, "
+                    "reward_value = ?, message = ? WHERE id = ?",
                     (reward, str(exc), job_id),
                 )
                 _update_state_after_job(state, reward, False, False, 0, 1, estimated_cost, f"Unexpected error: {exc}")
 
         status = "finished" if not errors else "finished_with_errors"
         message = (
-            f"adaptive_jobs={jobs_started}; skipped_budget={jobs_skipped_budget}; due_only={due_only}; "
-            f"new_catalysts={len(new_catalyst_ids)}"
+            f"{jobs_started} source checks, {jobs_skipped_budget} skipped for budget, "
+            f"{len(new_catalyst_ids)} new catalysts" + ("" if due_only else " (forced run)")
         )
         if errors:
-            message += "; errors=" + "; ".join(errors[:4])
+            message += ". Errors: " + "; ".join(errors[:4])
         execute(
-            "UPDATE monitor_runs SET status = ?, message = ?, new_catalysts = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE monitor_runs SET status = ?, message = ?, new_catalysts = ?, finished_at = "
+            "CURRENT_TIMESTAMP WHERE id = ?",
             (status, clean_text(message, 1500), len(new_catalyst_ids), run_id),
         )
         return {
@@ -760,15 +858,9 @@ def scheduler_dashboard() -> dict[str, Any]:
 
 
 class AdaptiveSchedulerDaemon:
-    """Small in-process scheduler loop for local demos.
-
-    It does not blindly monitor on a fixed interval. The loop only wakes up to ask
-    SQLite which sources are due according to their own dynamic next_check_at.
-    """
-
     def __init__(self) -> None:
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -786,7 +878,6 @@ class AdaptiveSchedulerDaemon:
         return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
 
     def _run(self) -> None:
-        
         if self._stop.wait(5):
             return
         while not self._stop.is_set():
@@ -798,7 +889,6 @@ class AdaptiveSchedulerDaemon:
                     max_jobs=settings.adaptive_max_jobs_per_tick,
                 )
             except Exception:
-                
-                pass
+                logger.exception("Scheduler tick failed")
             if self._stop.wait(max(settings.scheduler_tick_seconds, 10)):
                 break

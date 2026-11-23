@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import re
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Any, Callable, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -12,13 +14,36 @@ from bs4 import BeautifulSoup
 from app.config import settings
 from app.db import execute, rows
 from app.services.sources import fetch_url_text
-from app.services.utils import clean_text, normalize_url, source_key
+from app.services.utils import clean_text, normalize_url, redact_secrets, source_key
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-/]{2,}")
 _STOPWORDS = {
-    "the", "and", "for", "with", "from", "that", "this", "there", "their", "company", "source",
-    "evidence", "relationship", "program", "trial", "study", "results", "press", "release", "pipeline",
-    "therapy", "therapeutics", "pharmaceuticals", "biopharmaceutical", "announces", "announced",
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "there",
+    "their",
+    "company",
+    "source",
+    "evidence",
+    "relationship",
+    "program",
+    "trial",
+    "study",
+    "results",
+    "press",
+    "release",
+    "pipeline",
+    "therapy",
+    "therapeutics",
+    "pharmaceuticals",
+    "biopharmaceutical",
+    "announces",
+    "announced",
 }
 
 OFFICIAL_DOMAIN_HINTS = {
@@ -41,7 +66,7 @@ def _tokens(text: str) -> set[str]:
 def _domain(url: str) -> str:
     try:
         return urlparse(url).netloc.lower().replace("www.", "")
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         return ""
 
 
@@ -51,7 +76,7 @@ def _raw(doc: dict[str, Any]) -> dict[str, Any]:
         return raw
     try:
         return json.loads(raw or "{}")
-    except Exception:
+    except (TypeError, ValueError):
         return {}
 
 
@@ -62,13 +87,7 @@ def _source_text_from_html(html: str) -> str:
     return clean_text(soup.get_text(" "), 12000)
 
 
-def _offline_verification(doc: dict[str, Any], expected_terms: Optional[list[str]] = None) -> dict[str, Any]:
-    """Non-network source integrity audit.
-
-    This is deliberately conservative. It does not claim a URL proves an excerpt;
-    it only separates official metadata, manual placeholders, and relationship
-    evidence that still needs URL-level verification.
-    """
+def _offline_verification(doc: dict[str, Any], expected_terms: list[str] | None = None) -> dict[str, Any]:
     source_type = str(doc.get("source_type") or "").lower()
     url = normalize_url(doc.get("url", ""))
     domain = _domain(url)
@@ -79,7 +98,9 @@ def _offline_verification(doc: dict[str, Any], expected_terms: Optional[list[str
         return {
             "verification_status": "manual_unverified",
             "verification_score": 0.15,
-            "verification_reason": "Manual/no external URL. Use for demos, but treat as analyst-entered evidence until replaced with a real URL.",
+            "verification_reason": (
+                "No external URL. Treat this as analyst-entered evidence until a real source link is added."
+            ),
             "canonical_url": url,
             "content_hash": "",
         }
@@ -89,7 +110,7 @@ def _offline_verification(doc: dict[str, Any], expected_terms: Optional[list[str
             return {
                 "verification_status": "official_metadata_trusted",
                 "verification_score": 0.82,
-                "verification_reason": f"Official-source URL/domain matched {official_type}. Full page fetch was not required for this audit pass.",
+                "verification_reason": f"URL is on the official {domain} domain, so the page was not fetched.",
                 "canonical_url": url,
                 "content_hash": source_key(doc.get("title", ""), doc.get("excerpt", ""))[:24],
             }
@@ -100,22 +121,28 @@ def _offline_verification(doc: dict[str, Any], expected_terms: Optional[list[str
         placeholder = "placeholder" in excerpt.lower() or "verify" in excerpt.lower()
         excerpt_terms = _tokens(excerpt)
         title_terms = _tokens(str(doc.get("title") or ""))
-        
-        
-        
+
         generic_demo_domain = domain in {"example.com", "example.org", "example.net"}
         if not placeholder and url and not generic_demo_domain and len(excerpt_terms | title_terms) >= 6:
             return {
                 "verification_status": "relationship_metadata_trusted",
                 "verification_score": 0.74,
-                "verification_reason": "Peer relationship evidence has a real URL plus a specific target/indication/program excerpt. Offline metadata gate passed; fetch verification can still be run for final approval.",
+                "verification_reason": (
+                    "Peer relationship has a real URL and a specific target, indication or program excerpt. "
+                    "Fetch the page to confirm before final approval."
+                ),
                 "canonical_url": url,
                 "content_hash": source_key(doc.get("title", ""), excerpt)[:24],
             }
         return {
             "verification_status": "relationship_url_unchecked",
             "verification_score": 0.42 if not placeholder else 0.28,
-            "verification_reason": "Peer relationship has a URL, but the page text was not fetched/verified. Confidence is capped until source verification is run." if not auto_added else "Watchlist peer evidence was auto-added from stored metadata; run URL verification or analyst review before approving.",
+            "verification_reason": (
+                "Peer relationship has a URL, but the page has not been fetched. Confidence stays capped "
+                "until it is checked."
+            )
+            if not auto_added
+            else "Added automatically from the watchlist. Verify the URL or review it before approving.",
             "canonical_url": url,
             "content_hash": source_key(doc.get("title", ""), excerpt)[:24],
         }
@@ -124,28 +151,38 @@ def _offline_verification(doc: dict[str, Any], expected_terms: Optional[list[str
         return {
             "verification_status": "manual_url_unchecked",
             "verification_score": 0.32,
-            "verification_reason": "Manual catalyst has a URL but page text was not fetched. Treat as unverified until source verification is run.",
+            "verification_reason": (
+                "Manual catalyst has a URL, but the page has not been fetched. Treat it as unverified until checked."
+            ),
             "canonical_url": url,
             "content_hash": source_key(doc.get("title", ""), doc.get("excerpt", ""))[:24],
         }
 
-    
     expected = _tokens(" ".join(expected_terms))
     doc_terms = _tokens(" ".join([str(doc.get("title") or ""), str(doc.get("excerpt") or "")]))
     expected_overlap = len(expected & doc_terms) / max(len(expected), 1) if expected else 0.0
     generic_demo_domain = domain in {"example.com", "example.org", "example.net"}
-    if source_type == "company_news" and url and not generic_demo_domain and len(doc_terms) >= 8 and not any(x in str(doc.get("excerpt") or "").lower() for x in ["placeholder", "verify before approving"]):
+    if (
+        source_type == "company_news"
+        and url
+        and not generic_demo_domain
+        and len(doc_terms) >= 8
+        and not any(x in str(doc.get("excerpt") or "").lower() for x in ["placeholder", "verify before approving"])
+    ):
         return {
             "verification_status": "company_metadata_trusted",
             "verification_score": round(min(0.76, 0.72 + expected_overlap * 0.04), 3),
-            "verification_reason": "Company-source URL has a specific title/excerpt and passed offline metadata review. Fetch verification can still be run before investment-grade approval.",
+            "verification_reason": (
+                "Company URL with a specific title and excerpt passed the offline check. "
+                "Fetch the page to confirm before relying on it."
+            ),
             "canonical_url": url,
             "content_hash": source_key(doc.get("title", ""), doc.get("excerpt", ""))[:24],
         }
     return {
         "verification_status": "discovery_url_unchecked",
         "verification_score": round(min(0.62, 0.36 + expected_overlap * 0.20), 3),
-        "verification_reason": "Source has an external URL but was not fetched in this pass; confidence remains capped until checked.",
+        "verification_reason": "External URL not fetched yet; confidence stays capped until it is checked.",
         "canonical_url": url,
         "content_hash": source_key(doc.get("title", ""), doc.get("excerpt", ""))[:24],
     }
@@ -153,17 +190,11 @@ def _offline_verification(doc: dict[str, Any], expected_terms: Optional[list[str
 
 def verify_source_doc(
     doc: dict[str, Any],
-    expected_terms: Optional[list[str]] = None,
+    expected_terms: list[str] | None = None,
     *,
     fetch: bool = False,
-    fetcher: Optional[Callable[[str], str]] = None,
+    fetcher: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
-    """Verify that a stored source document is traceable to its URL.
-
-    When fetch=False, this performs a safe offline audit that never touches the
-    network. When fetch=True, it downloads the URL text and checks whether the
-    stored title/excerpt/key terms are actually supported by the page.
-    """
     offline = _offline_verification(doc, expected_terms)
     url = offline.get("canonical_url") or normalize_url(doc.get("url", ""))
     if not fetch or not url or str(url).startswith("manual://"):
@@ -173,7 +204,13 @@ def verify_source_doc(
         if fetcher:
             html = fetcher(url)
         else:
-            html = fetch_url_text(url, timeout=min(float(settings.source_verification_timeout_seconds), float(settings.request_timeout_seconds)), use_scraperapi=bool(settings.scraperapi_api_key))
+            html = fetch_url_text(
+                url,
+                timeout=min(
+                    float(settings.source_verification_timeout_seconds), float(settings.request_timeout_seconds)
+                ),
+                use_scraperapi=bool(settings.scraperapi_api_key),
+            )
         page_text = _source_text_from_html(html)
         if not page_text:
             raise ValueError("No readable page text extracted")
@@ -186,12 +223,22 @@ def verify_source_doc(
         title_score = len(title_terms & page_terms) / max(len(title_terms), 1) if title_terms else 0.0
         excerpt_score = len(excerpt_terms & page_terms) / max(len(excerpt_terms), 1) if excerpt_terms else 0.0
         expected_score = len(expected & page_terms) / max(len(expected), 1) if expected else 0.0
-        
+
         page_low = page_text.lower()
         title_phrase = 1.0 if title_text and clean_text(title_text, 180).lower() in page_low else 0.0
         excerpt_clean = clean_text(excerpt_text, 260).lower()
         excerpt_phrase = 1.0 if excerpt_clean and excerpt_clean[:180] in page_low else 0.0
-        score = round(min(1.0, (title_score * 0.25) + (excerpt_score * 0.35) + (expected_score * 0.15) + (title_phrase * 0.10) + (excerpt_phrase * 0.15)), 3)
+        score = round(
+            min(
+                1.0,
+                (title_score * 0.25)
+                + (excerpt_score * 0.35)
+                + (expected_score * 0.15)
+                + (title_phrase * 0.10)
+                + (excerpt_phrase * 0.15),
+            ),
+            3,
+        )
         status = "url_verified" if score >= 0.42 else "url_verified_weak_match"
         reason = (
             f"Fetched source page and compared stored title/excerpt/key terms plus exact snippet phrases. "
@@ -209,12 +256,13 @@ def verify_source_doc(
         fallback = dict(offline)
         fallback["verification_status"] = "fetch_failed"
         fallback["verification_score"] = min(float(fallback.get("verification_score") or 0.0), 0.25)
-        fallback["verification_reason"] = f"Could not verify URL text: {exc}. Confidence remains capped."
+        fallback["verification_reason"] = (
+            f"Could not verify URL text: {redact_secrets(str(exc))}. Confidence remains capped."
+        )
         return fallback
 
 
-def verify_sources_for_catalyst(catalyst_id: int, *, fetch: Optional[bool] = None) -> list[dict[str, Any]]:
-    """Run source verification for every source document attached to a catalyst."""
+def verify_sources_for_catalyst(catalyst_id: int, *, fetch: bool | None = None) -> list[dict[str, Any]]:
     if fetch is None:
         fetch = bool(settings.source_verification_fetch_on_analyze)
     catalyst_rows = rows(
@@ -229,16 +277,21 @@ def verify_sources_for_catalyst(catalyst_id: int, *, fetch: Optional[bool] = Non
     expected_terms: list[str] = []
     if catalyst_rows:
         cat = catalyst_rows[0]
-        expected_terms.extend([str(cat.get("title") or ""), str(cat.get("summary") or ""), str(cat.get("company_name") or ""), str(cat.get("ticker") or "")])
+        expected_terms.extend(
+            [
+                str(cat.get("title") or ""),
+                str(cat.get("summary") or ""),
+                str(cat.get("company_name") or ""),
+                str(cat.get("ticker") or ""),
+            ]
+        )
         for key in ["aliases_json", "targets_json", "indications_json"]:
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 expected_terms.extend(json.loads(cat.get(key) or "[]"))
-            except Exception:
-                pass
 
     docs = rows("SELECT * FROM source_docs WHERE catalyst_id = ? ORDER BY id", (catalyst_id,))
     verified: list[dict[str, Any]] = []
-    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    now = datetime.now(UTC).replace(microsecond=0).isoformat()
     for doc in docs:
         result = verify_source_doc(doc, expected_terms, fetch=fetch)
         execute(

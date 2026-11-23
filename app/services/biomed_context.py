@@ -24,11 +24,12 @@ def extract_biomedical_context(catalyst: dict[str, Any], source_docs: list[dict[
     elif event_type == "fda_decision":
         if not facts.get("has_regulatory_detail"):
             missing.append("specific FDA/regulatory action detail")
-        if not facts.get("has_safety_detail") and any("approved" in str(x).lower() for x in facts.get("regulatory_mentions", [])):
+        if not facts.get("has_safety_detail") and any(
+            "approved" in str(x).lower() for x in facts.get("regulatory_mentions", [])
+        ):
             missing.append("label/safety detail")
-    elif event_type in {"licensing_deal", "acquisition"}:
-        if not facts.get("has_deal_terms"):
-            missing.append("deal terms such as upfront, milestones, royalty, cash/equity, or tender value")
+    elif event_type in {"licensing_deal", "acquisition"} and not facts.get("has_deal_terms"):
+        missing.append("deal terms such as upfront, milestones, royalty, cash/equity, or tender value")
 
     if not missing:
         level = "high"
@@ -46,7 +47,10 @@ def extract_biomedical_context(catalyst: dict[str, Any], source_docs: list[dict[
         "has_trial_design_detail": bool(facts.get("has_design_detail")),
         "has_p_value_or_statistic": bool(facts.get("has_quantified_effect")),
         "has_regulatory_detail": bool(facts.get("has_regulatory_detail")),
-        "has_standard_of_care_detail": any("standard of care" in str(x).lower() or "first-line" in str(x).lower() for x in facts.get("endpoint_mentions", [])),
+        "has_standard_of_care_detail": any(
+            "standard of care" in str(x).lower() or "first-line" in str(x).lower()
+            for x in facts.get("endpoint_mentions", [])
+        ),
         "has_deal_terms": bool(facts.get("has_deal_terms")),
         "clinical_facts": facts,
         "clinical_summary": clinical_summary_sentence(facts),
@@ -55,8 +59,9 @@ def extract_biomedical_context(catalyst: dict[str, Any], source_docs: list[dict[
     }
 
 
-def apply_biomedical_context_guardrails(analysis: dict[str, Any], catalyst: dict[str, Any], source_docs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Cap confidence when a trial/regulatory/deal report lacks concrete specifics."""
+def apply_biomedical_context_guardrails(
+    analysis: dict[str, Any], catalyst: dict[str, Any], source_docs: list[dict[str, Any]]
+) -> dict[str, Any]:
     context = extract_biomedical_context(catalyst, source_docs)
     level = context["biomedical_evidence_level"]
     event_type = context["event_type"]
@@ -75,21 +80,24 @@ def apply_biomedical_context_guardrails(analysis: dict[str, Any], catalyst: dict
         for effect in analysis.get("effects", []) or []:
             try:
                 effect["confidence"] = min(float(effect.get("confidence", 0.4) or 0.4), ecap)
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 effect["confidence"] = min(0.4, ecap)
             layer = str(effect.get("layer") or "")
             if layer in {"target", "indication", "peer"}:
                 effect["rationale"] = (
                     str(effect.get("rationale", ""))
-                    + f" Biomedical context audit: confidence capped because source detail is {level}; extracted facts: {clinical_summary}; missing {missing or 'clinical/deal specifics'}."
+                    + f" Capped because the source detail is {level}. Found: {clinical_summary}."
+                    + f" Missing: {missing or 'clinical or deal specifics'}."
                 ).strip()
         try:
             analysis["overall_confidence"] = min(float(analysis.get("overall_confidence", 0.4) or 0.4), cap)
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             analysis["overall_confidence"] = min(0.4, cap)
     else:
         for effect in analysis.get("effects", []) or []:
-            effect["rationale"] = (str(effect.get("rationale", "")) + f" Biomedical context audit: concrete details extracted ({clinical_summary}).").strip()
+            effect["rationale"] = (
+                str(effect.get("rationale", "")) + f" Source detail found: {clinical_summary}."
+            ).strip()
 
     analysis["biomedical_context_audit"] = context
     return analysis

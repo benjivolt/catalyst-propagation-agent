@@ -14,10 +14,43 @@ RELATIONSHIP_SOURCE_TYPES = {"peer_relationship", "watchlist_peer_evidence"}
 TRUSTED_SOURCE_TYPES = OFFICIAL_SOURCE_TYPES | RELATIONSHIP_SOURCE_TYPES | {"company_news", "manual", "gdelt_news"}
 
 _STOPWORDS = {
-    "the", "and", "for", "with", "that", "this", "from", "have", "has", "was", "were",
-    "are", "into", "than", "then", "there", "their", "will", "would", "could", "should",
-    "about", "after", "before", "because", "source", "company", "trial", "study", "results",
-    "peer", "relationship", "evidence", "target", "program", "overlap", "indication",
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "have",
+    "has",
+    "was",
+    "were",
+    "are",
+    "into",
+    "than",
+    "then",
+    "there",
+    "their",
+    "will",
+    "would",
+    "could",
+    "should",
+    "about",
+    "after",
+    "before",
+    "because",
+    "source",
+    "company",
+    "trial",
+    "study",
+    "results",
+    "peer",
+    "relationship",
+    "evidence",
+    "target",
+    "program",
+    "overlap",
+    "indication",
 }
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]{2,}")
 
@@ -27,7 +60,6 @@ def _tokens(text: str) -> set[str]:
 
 
 def claim_support_score(claim: str, doc: dict[str, Any] | None) -> float:
-    """Lightweight lexical grounding score used as an audit, not a medical fact checker."""
     if not claim or not doc:
         return 0.0
     claim_terms = _tokens(claim)
@@ -38,7 +70,7 @@ def claim_support_score(claim: str, doc: dict[str, Any] | None) -> float:
     if not doc_terms:
         return 0.0
     overlap = claim_terms & doc_terms
-    
+
     return min(1.0, len(overlap) / max(len(claim_terms), 1))
 
 
@@ -53,12 +85,11 @@ def _verification_score(source_doc: dict[str, Any] | None) -> float:
         return 0.0
     try:
         return float(source_doc.get("verification_score") or 0.0)
-    except Exception:
+    except (TypeError, ValueError):
         return 0.0
 
 
 def is_verified_source(source_doc: dict[str, Any] | None) -> bool:
-    """A verified source either comes from an official source/domain audit or a fetched URL match."""
     status = _verification_status(source_doc)
     score = _verification_score(source_doc)
     return status in {"official_metadata_trusted", "url_verified"} or score >= 0.72
@@ -71,9 +102,13 @@ def source_tier(source_doc: dict[str, Any] | None) -> str:
     publisher = str(source_doc.get("publisher") or "").lower()
     status = _verification_status(source_doc)
     verified = is_verified_source(source_doc)
-    official_like = source_type in OFFICIAL_SOURCE_TYPES or any(x in publisher for x in ["fda", "sec", "clinicaltrials", "pubmed", "ncbi"])
+    official_like = source_type in OFFICIAL_SOURCE_TYPES or any(
+        x in publisher for x in ["fda", "sec", "clinicaltrials", "pubmed", "ncbi"]
+    )
     if official_like and status != "fetch_failed":
-        return "official" if verified or status in {"not_checked", "official_metadata_trusted"} else "official_unverified"
+        return (
+            "official" if verified or status in {"not_checked", "official_metadata_trusted"} else "official_unverified"
+        )
     if source_type in RELATIONSHIP_SOURCE_TYPES:
         return "relationship_verified" if verified else "relationship_unverified"
     if source_type == "manual":
@@ -82,6 +117,7 @@ def source_tier(source_doc: dict[str, Any] | None) -> str:
         return "trusted_verified" if verified else "trusted_unverified"
     return "discovery_verified" if verified else "discovery_unverified"
 
+
 def _effect_claim_docs(effect: dict[str, Any], source_by_index: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
     docs: list[dict[str, Any]] = []
     for claim in effect.get("claims", []) or []:
@@ -89,14 +125,12 @@ def _effect_claim_docs(effect: dict[str, Any], source_by_index: dict[int, dict[s
             continue
         try:
             idx = int(claim.get("source_index") or 0)
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             idx = 0
         doc = source_by_index.get(idx)
         if doc:
             docs.append(doc)
     return docs
-
-
 
 
 def _distinct_source_count(docs: list[dict[str, Any]]) -> int:
@@ -109,24 +143,25 @@ def _distinct_source_count(docs: list[dict[str, Any]]) -> int:
 
 
 def _verified_url_count(docs: list[dict[str, Any]]) -> int:
-    
-    
-    return sum(1 for doc in docs if _verification_status(doc) == "url_verified" or source_tier(doc) == "official" or is_verified_source(doc))
+    return sum(
+        1
+        for doc in docs
+        if _verification_status(doc) == "url_verified" or source_tier(doc) == "official" or is_verified_source(doc)
+    )
+
 
 def apply_evidence_guardrails(analysis: dict[str, Any], source_docs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Attach an evidence audit and conservatively downgrade weak/uncited effects.
-
-    The LLM is allowed to reason, but the app never lets high-confidence effects
-    pass through without citations. Peer effects require two kinds of grounding:
-    a catalyst/event source and a peer-relationship source. If the relationship
-    source is missing, the read-through can still appear, but confidence is capped.
-    """
     source_by_index = {idx: doc for idx, doc in enumerate(source_docs, start=1)}
     official_count = sum(1 for doc in source_docs if source_tier(doc) == "official")
     verified_source_count = sum(1 for doc in source_docs if is_verified_source(doc))
     relationship_count = sum(1 for doc in source_docs if source_tier(doc).startswith("relationship"))
     verified_relationship_count = sum(1 for doc in source_docs if source_tier(doc) == "relationship_verified")
-    trusted_count = sum(1 for doc in source_docs if source_tier(doc) in {"official", "trusted_verified", "relationship_verified", "manual_verified", "discovery_verified"})
+    trusted_count = sum(
+        1
+        for doc in source_docs
+        if source_tier(doc)
+        in {"official", "trusted_verified", "relationship_verified", "manual_verified", "discovery_verified"}
+    )
     total_claims = 0
     cited_claims = 0
     weak_claims = 0
@@ -143,7 +178,9 @@ def apply_evidence_guardrails(analysis: dict[str, Any], source_docs: list[dict[s
         if not claims:
             unsupported_effects += 1
             effect["confidence"] = min(float(effect.get("confidence", 0.35) or 0.35), 0.35)
-            effect["rationale"] = (str(effect.get("rationale", "")) + " Evidence audit: no cited claim was attached, so confidence was capped.").strip()
+            effect["rationale"] = (
+                str(effect.get("rationale", "")) + " No claim cites a source, so confidence is capped."
+            ).strip()
             continue
         effect_scores: list[float] = []
         for claim in claims:
@@ -152,7 +189,7 @@ def apply_evidence_guardrails(analysis: dict[str, Any], source_docs: list[dict[s
             total_claims += 1
             try:
                 source_index = int(claim.get("source_index") or 0)
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 source_index = 0
             doc = source_by_index.get(source_index)
             if doc:
@@ -160,10 +197,10 @@ def apply_evidence_guardrails(analysis: dict[str, Any], source_docs: list[dict[s
             lexical_score = claim_support_score(str(claim.get("claim") or ""), doc)
             verification_score = _verification_score(doc)
             tier = source_tier(doc)
-            
-            
-            
-            verification_floor = 0.80 if is_verified_source(doc) or tier == "official" else max(0.35, verification_score)
+
+            verification_floor = (
+                0.80 if is_verified_source(doc) or tier == "official" else max(0.35, verification_score)
+            )
             score = min(lexical_score, verification_floor)
             claim["support_score"] = round(score, 3)
             claim["lexical_support_score"] = round(lexical_score, 3)
@@ -175,56 +212,64 @@ def apply_evidence_guardrails(analysis: dict[str, Any], source_docs: list[dict[s
             threshold = 0.08 if tier.startswith("relationship") else 0.12
             if score < threshold:
                 weak_claims += 1
-            if tier.endswith("unverified") or _verification_status(doc) in {"fetch_failed", "manual_unverified", "manual_url_unchecked", "relationship_url_unchecked", "discovery_url_unchecked"}:
+            if tier.endswith("unverified") or _verification_status(doc) in {
+                "fetch_failed",
+                "manual_unverified",
+                "manual_url_unchecked",
+                "relationship_url_unchecked",
+                "discovery_url_unchecked",
+            }:
                 source_verification_gaps += 1
         docs = _effect_claim_docs(effect, source_by_index)
         distinct_sources = _distinct_source_count(docs)
         verified_or_official_sources = _verified_url_count(docs)
 
-        
-        
         try:
             current_conf = float(effect.get("confidence", 0.4) or 0.4)
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             current_conf = 0.4
         if current_conf > 0.74 and verified_or_official_sources == 0:
             high_confidence_without_verified_url += 1
             effect["confidence"] = min(current_conf, 0.74)
             effect["rationale"] = (
-                str(effect.get("rationale", ""))
-                + " Evidence audit: confidence capped because no cited source was URL-verified or official-source trusted."
+                str(effect.get("rationale", "")) + " Capped: none of the cited sources is verified or official."
             ).strip()
 
-        if str(effect.get("layer")) == "peer" and str(effect.get("readthrough_type")) in {"validation", "competitive", "partner"}:
+        if str(effect.get("layer")) == "peer" and str(effect.get("readthrough_type")) in {
+            "validation",
+            "competitive",
+            "partner",
+        }:
             has_relationship_source = any(source_tier(doc).startswith("relationship") for doc in docs)
             has_verified_relationship_source = any(source_tier(doc) == "relationship_verified" for doc in docs)
             if not has_relationship_source:
                 peer_relationship_missing += 1
                 effect["confidence"] = min(float(effect.get("confidence", 0.45) or 0.45), 0.55)
                 effect["rationale"] = (
-                    str(effect.get("rationale", ""))
-                    + " Evidence audit: peer relationship source was missing, so confidence was capped."
+                    str(effect.get("rationale", "")) + " Capped: no source documents the peer relationship."
                 ).strip()
             elif not has_verified_relationship_source:
                 peer_relationship_unverified += 1
                 effect["confidence"] = min(float(effect.get("confidence", 0.45) or 0.45), 0.50)
                 effect["rationale"] = (
                     str(effect.get("rationale", ""))
-                    + " Evidence audit: peer relationship source exists but is not URL-verified, so confidence was capped pending analyst review."
+                    + " Capped until reviewed: the peer relationship source has not been verified."
                 ).strip()
-            
-            
+
             if distinct_sources < 2 or verified_or_official_sources < 1:
                 peer_corroboration_gaps += 1
                 effect["confidence"] = min(float(effect.get("confidence", 0.45) or 0.45), 0.60)
                 effect["rationale"] = (
                     str(effect.get("rationale", ""))
-                    + " Corroboration gate: major peer read-throughs require at least two distinct cited sources and one verified/official source."
+                    + " Capped: a peer read-through needs two distinct sources, one of them verified or official."
                 ).strip()
         if not effect_scores or max(effect_scores) < 0.10:
             unsupported_effects += 1
             effect["confidence"] = min(float(effect.get("confidence", 0.4) or 0.4), 0.45)
-            effect["rationale"] = (str(effect.get("rationale", "")) + " Evidence audit: citation support looked weak; confidence was capped pending human review.").strip()
+            effect["rationale"] = (
+                str(effect.get("rationale", ""))
+                + " Capped until reviewed: the cited text only weakly supports the claims."
+            ).strip()
         elif sum(effect_scores) / len(effect_scores) < 0.18:
             effect["confidence"] = min(float(effect.get("confidence", 0.5) or 0.5), 0.65)
 
@@ -257,12 +302,10 @@ def apply_evidence_guardrails(analysis: dict[str, Any], source_docs: list[dict[s
     else:
         grade = "D"
 
-    
-    
     grade_caps = {"A": 0.95, "B": 0.82, "C": 0.68, "D": 0.50}
     try:
         analysis["overall_confidence"] = min(float(analysis.get("overall_confidence", 0.4) or 0.4), grade_caps[grade])
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         analysis["overall_confidence"] = min(0.4, grade_caps[grade])
     requires_human_review = (
         grade != "A"
@@ -295,7 +338,10 @@ def apply_evidence_guardrails(analysis: dict[str, Any], source_docs: list[dict[s
         "peer_corroboration_gap_count": peer_corroboration_gaps,
         "high_confidence_without_verified_url_count": high_confidence_without_verified_url,
         "requires_human_review": requires_human_review,
-        "guardrail": "confidence capped when effects lacked citations, peer relationship evidence, multi-source corroboration, URL/source verification, or source support",
+        "guardrail": (
+            "confidence capped when effects lacked citations, peer relationship evidence, "
+            "multi-source corroboration, URL/source verification, or source support"
+        ),
     }
     analysis["evidence_audit"] = audit
     return analysis

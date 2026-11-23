@@ -2,34 +2,120 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from app.db import execute, row, rows
 from app.services.evidence import is_verified_source, source_tier
-from app.services.utils import clean_text, normalize_url
+from app.services.utils import clean_text
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+\-/]{1,}")
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
 _STOPWORDS = {
-    "the", "and", "for", "with", "that", "this", "from", "into", "than", "then", "there", "their",
-    "will", "would", "could", "should", "about", "after", "before", "because", "source", "company",
-    "companies", "trial", "study", "results", "data", "drug", "therapy", "therapies", "program", "programs",
-    "target", "targets", "indication", "indications", "effect", "effects", "readthrough", "read", "through",
-    "positive", "negative", "neutral", "supports", "support", "may", "can", "likely", "potentially", "suggests",
-    "evidence", "peer", "peers", "catalyst", "event", "announced", "announces", "reported", "reports",
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "than",
+    "then",
+    "there",
+    "their",
+    "will",
+    "would",
+    "could",
+    "should",
+    "about",
+    "after",
+    "before",
+    "because",
+    "source",
+    "company",
+    "companies",
+    "trial",
+    "study",
+    "results",
+    "data",
+    "drug",
+    "therapy",
+    "therapies",
+    "program",
+    "programs",
+    "target",
+    "targets",
+    "indication",
+    "indications",
+    "effect",
+    "effects",
+    "readthrough",
+    "read",
+    "through",
+    "positive",
+    "negative",
+    "neutral",
+    "supports",
+    "support",
+    "may",
+    "can",
+    "likely",
+    "potentially",
+    "suggests",
+    "evidence",
+    "peer",
+    "peers",
+    "catalyst",
+    "event",
+    "announced",
+    "announces",
+    "reported",
+    "reports",
 }
 _NEGATIVE_TERMS = {
-    "failed", "failure", "missed", "terminated", "discontinued", "halted", "hold", "crl", "complete response",
-    "not statistically significant", "did not meet", "safety concern", "adverse", "withdrawn", "rejected",
+    "failed",
+    "failure",
+    "missed",
+    "terminated",
+    "discontinued",
+    "halted",
+    "hold",
+    "crl",
+    "complete response",
+    "not statistically significant",
+    "did not meet",
+    "safety concern",
+    "adverse",
+    "withdrawn",
+    "rejected",
 }
 _POSITIVE_TERMS = {
-    "approved", "approval", "met", "statistically significant", "positive", "successful", "granted", "accepted",
-    "priority review", "breakthrough", "clearance", "authorization", "acquire", "acquisition", "licensed",
+    "approved",
+    "approval",
+    "met",
+    "statistically significant",
+    "positive",
+    "successful",
+    "granted",
+    "accepted",
+    "priority review",
+    "breakthrough",
+    "clearance",
+    "authorization",
+    "acquire",
+    "acquisition",
+    "licensed",
 }
-_OFFICIAL_TYPES = {"sec_edgar", "fda_press_announcements", "openfda_drugs", "clinicaltrials_gov", "pubmed", "company_news"}
+_OFFICIAL_TYPES = {
+    "sec_edgar",
+    "fda_press_announcements",
+    "openfda_drugs",
+    "clinicaltrials_gov",
+    "pubmed",
+    "company_news",
+}
 
 SOURCE_REQUIREMENTS: dict[str, dict[str, Any]] = {
     "regulatory_fact": {
@@ -49,22 +135,43 @@ SOURCE_REQUIREMENTS: dict[str, dict[str, Any]] = {
         "max_without_preferred": 0.70,
     },
     "peer_relationship_fact": {
-        "preferred": {"peer_relationship", "watchlist_peer_evidence", "company_news", "clinicaltrials_gov", "sec_edgar"},
+        "preferred": {
+            "peer_relationship",
+            "watchlist_peer_evidence",
+            "company_news",
+            "clinicaltrials_gov",
+            "sec_edgar",
+        },
         "max_without_preferred": 0.55,
     },
     "propagation_inference": {
-        "preferred": {"company_news", "sec_edgar", "fda_press_announcements", "openfda_drugs", "peer_relationship", "clinicaltrials_gov", "pubmed"},
+        "preferred": {
+            "company_news",
+            "sec_edgar",
+            "fda_press_announcements",
+            "openfda_drugs",
+            "peer_relationship",
+            "clinicaltrials_gov",
+            "pubmed",
+        },
         "max_without_preferred": 0.65,
     },
     "background_fact": {
-        "preferred": {"company_news", "clinicaltrials_gov", "pubmed", "peer_relationship", "sec_edgar", "openfda_drugs"},
+        "preferred": {
+            "company_news",
+            "clinicaltrials_gov",
+            "pubmed",
+            "peer_relationship",
+            "sec_edgar",
+            "openfda_drugs",
+        },
         "max_without_preferred": 0.72,
     },
 }
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def _hash(text: str) -> str:
@@ -88,7 +195,7 @@ def _token_set(text: Any) -> set[str]:
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
@@ -98,7 +205,7 @@ def _raw_json(doc: dict[str, Any]) -> dict[str, Any]:
         return raw
     try:
         return json.loads(raw or "{}")
-    except Exception:
+    except (TypeError, ValueError):
         return {}
 
 
@@ -161,15 +268,37 @@ def _claim_type(claim: str, effect: dict[str, Any] | None = None) -> str:
     readthrough = str((effect or {}).get("readthrough_type") or "").lower()
     if any(x in low for x in ["fda", "approval", "approved", "crl", "complete response", "pdufa", "adcom", "label"]):
         return "regulatory_fact"
-    if any(x in low for x in ["endpoint", "phase", "trial", "readout", "statistically", "p-value", "p value", "met", "failed", "safety"]):
+    if any(
+        x in low
+        for x in [
+            "endpoint",
+            "phase",
+            "trial",
+            "readout",
+            "statistically",
+            "p-value",
+            "p value",
+            "met",
+            "failed",
+            "safety",
+        ]
+    ):
         return "trial_result_fact"
-    if any(x in low for x in ["acquisition", "acquire", "merger", "license", "licensing", "royalty", "milestone", "collaboration"]):
+    if any(
+        x in low
+        for x in ["acquisition", "acquire", "merger", "license", "licensing", "royalty", "milestone", "collaboration"]
+    ):
         return "deal_fact"
     if layer == "peer" or readthrough in {"validation", "competitive", "partner"}:
-        if any(x in low for x in ["peer", "competitor", "partner", "same-target", "same target", "same indication", "overlap"]):
+        if any(
+            x in low
+            for x in ["peer", "competitor", "partner", "same-target", "same target", "same indication", "overlap"]
+        ):
             return "peer_relationship_fact"
         return "propagation_inference"
-    if layer in {"target", "indication"} or any(x in low for x in ["validates", "undermines", "biology", "standard of care", "competitive bar"]):
+    if layer in {"target", "indication"} or any(
+        x in low for x in ["validates", "undermines", "biology", "standard of care", "competitive bar"]
+    ):
         return "propagation_inference"
     if any(x in low for x in ["agonist", "inhibitor", "receptor", "target", "mechanism", "modality"]):
         return "drug_target_fact"
@@ -211,8 +340,12 @@ def _source_type_ok(claim_type: str, doc: dict[str, Any] | None) -> bool:
 def _has_contradiction(claim: str, span: str) -> float:
     claim_low = claim.lower()
     span_low = span.lower()
-    claim_positive = any(t in claim_low for t in _POSITIVE_TERMS) or any(t in claim_low for t in ["validates", "supports", "helps", "positive"])
-    claim_negative = any(t in claim_low for t in _NEGATIVE_TERMS) or any(t in claim_low for t in ["undermines", "hurts", "negative"])
+    claim_positive = any(t in claim_low for t in _POSITIVE_TERMS) or any(
+        t in claim_low for t in ["validates", "supports", "helps", "positive"]
+    )
+    claim_negative = any(t in claim_low for t in _NEGATIVE_TERMS) or any(
+        t in claim_low for t in ["undermines", "hurts", "negative"]
+    )
     span_negative = any(t in span_low for t in _NEGATIVE_TERMS)
     span_positive = any(t in span_low for t in _POSITIVE_TERMS)
     if claim_positive and span_negative and not span_positive:
@@ -246,7 +379,9 @@ def _entity_match_score(claim: str, span: str) -> float:
     return len(important & span_tokens) / max(len(important), 1)
 
 
-def _retrieval_score(claim: str, paragraph: dict[str, Any], doc: dict[str, Any] | None, cited_source_doc_id: int | None) -> float:
+def _retrieval_score(
+    claim: str, paragraph: dict[str, Any], doc: dict[str, Any] | None, cited_source_doc_id: int | None
+) -> float:
     coverage, _ = _coverage(claim, paragraph.get("text", ""))
     entity = _entity_match_score(claim, paragraph.get("text", ""))
     source_bonus = 0.12 if cited_source_doc_id and doc and int(doc.get("id") or 0) == cited_source_doc_id else 0.0
@@ -284,7 +419,9 @@ def _verification_label(claim: str, span: str, claim_type: str, doc: dict[str, A
     }
 
 
-def _confidence_cap(label: str, claim_type: str, doc: dict[str, Any] | None, contradiction: float, has_quote: bool) -> float:
+def _confidence_cap(
+    label: str, claim_type: str, doc: dict[str, Any] | None, contradiction: float, has_quote: bool
+) -> float:
     if not doc:
         return 0.20
     if not has_quote:
@@ -295,16 +432,16 @@ def _confidence_cap(label: str, claim_type: str, doc: dict[str, Any] | None, con
         return 0.35
     if label == "not_enough_information":
         return 0.50
-    if label == "partially_supported":
-        cap = 0.60
-    else:
-        cap = 0.88
+    cap = 0.60 if label == "partially_supported" else 0.88
     req = SOURCE_REQUIREMENTS.get(claim_type, SOURCE_REQUIREMENTS["background_fact"])
     if not _source_type_ok(claim_type, doc):
         cap = min(cap, float(req.get("max_without_preferred", 0.65)))
     if not is_verified_source(doc) and source_tier(doc) != "official":
         cap = min(cap, 0.72)
-    if claim_type == "peer_relationship_fact" and str(doc.get("source_type") or "") not in {"peer_relationship", "watchlist_peer_evidence"}:
+    if claim_type == "peer_relationship_fact" and str(doc.get("source_type") or "") not in {
+        "peer_relationship",
+        "watchlist_peer_evidence",
+    }:
         cap = min(cap, 0.55)
     if claim_type == "propagation_inference" and label != "supported":
         cap = min(cap, 0.65)
@@ -351,16 +488,27 @@ def create_source_snapshots_for_catalyst(catalyst_id: int) -> list[dict[str, Any
         for idx, (start, end, paragraph_text) in enumerate(_paragraph_candidates(text), start=1):
             execute(
                 """
-                INSERT INTO source_paragraphs (snapshot_id, paragraph_index, text, start_char, end_char, text_hash, embedding_id)
+                INSERT INTO source_paragraphs (snapshot_id, paragraph_index, text, start_char, end_char, text_hash,
+                    embedding_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (snapshot["id"], idx, paragraph_text, start, end, _hash(paragraph_text), f"local-token:{_hash(paragraph_text)[:20]}"),
+                (
+                    snapshot["id"],
+                    idx,
+                    paragraph_text,
+                    start,
+                    end,
+                    _hash(paragraph_text),
+                    f"local-token:{_hash(paragraph_text)[:20]}",
+                ),
             )
         snapshots.append(snapshot)
     return snapshots
 
 
-def _candidate_paragraphs(catalyst_id: int, claim: str, cited_source_doc_id: int | None, claim_type: str) -> list[dict[str, Any]]:
+def _candidate_paragraphs(
+    catalyst_id: int, claim: str, cited_source_doc_id: int | None, claim_type: str
+) -> list[dict[str, Any]]:
     paragraphs = rows(
         """
         SELECT sp.*, ss.source_doc_id, ss.source_type, ss.title AS snapshot_title, ss.url AS snapshot_url,
@@ -379,7 +527,11 @@ def _candidate_paragraphs(catalyst_id: int, claim: str, cited_source_doc_id: int
         doc_id = int(paragraph.get("source_doc_id") or 0)
         doc = doc_cache.get(doc_id)
         score = _retrieval_score(claim, paragraph, doc, cited_source_doc_id)
-        if claim_type in {"regulatory_fact", "deal_fact", "trial_result_fact"} and doc and _source_type_ok(claim_type, doc):
+        if (
+            claim_type in {"regulatory_fact", "deal_fact", "trial_result_fact"}
+            and doc
+            and _source_type_ok(claim_type, doc)
+        ):
             score += 0.05
         item = dict(paragraph)
         item["retrieval_score"] = round(min(1.0, score), 3)
@@ -392,7 +544,9 @@ def _candidate_paragraphs(catalyst_id: int, claim: str, cited_source_doc_id: int
 def _insert_atomic_claim(report_id: int, effect: dict[str, Any], claim: dict[str, Any], claim_type: str) -> int:
     text = clean_text(str(claim.get("claim") or ""), 1200)
     source_claim_id = int(claim.get("id") or 0)
-    existing = row("SELECT id FROM atomic_claims WHERE source_claim_id = ? AND atomic_claim = ?", (source_claim_id, text))
+    existing = row(
+        "SELECT id FROM atomic_claims WHERE source_claim_id = ? AND atomic_claim = ?", (source_claim_id, text)
+    )
     if existing:
         return int(existing["id"])
     return execute(
@@ -415,7 +569,10 @@ def _insert_atomic_claim(report_id: int, effect: dict[str, Any], claim: dict[str
             str(effect.get("entity") or "") if str(effect.get("layer") or "") == "indication" else "",
             "",
             str(effect.get("direction") or "neutral"),
-            "high" if claim_type in {"regulatory_fact", "trial_result_fact", "deal_fact", "peer_relationship_fact", "propagation_inference"} else "medium",
+            "high"
+            if claim_type
+            in {"regulatory_fact", "trial_result_fact", "deal_fact", "peer_relationship_fact", "propagation_inference"}
+            else "medium",
         ),
     )
 
@@ -437,14 +594,17 @@ def _final_status(best: dict[str, Any] | None, contradiction_score: float) -> st
 
 def _summary_reason(status: str, best: dict[str, Any] | None, missing: list[str], source_type_ok: bool) -> str:
     if not best:
-        return "No source paragraph reached the minimum retrieval threshold for this claim."
-    parts = [f"Best span was classified as {best.get('entailment_label')} with coverage {best.get('coverage_score'):.2f} and entailment {best.get('entailment_score'):.2f}."]
+        return "No source paragraph was close enough to this claim to check it."
+    parts = [
+        f"Closest source passage: {str(best.get('entailment_label') or 'unknown').replace('_', ' ')} "
+        f"(coverage {best.get('coverage_score'):.2f}, entailment {best.get('entailment_score'):.2f})."
+    ]
     if missing:
-        parts.append("Missing claim elements: " + ", ".join(missing[:8]) + ".")
+        parts.append("Not found in the source: " + ", ".join(missing[:8]) + ".")
     if not source_type_ok:
-        parts.append("The supporting source type is not preferred for this claim class, so confidence is capped.")
+        parts.append("This kind of claim needs a different type of source, so confidence is capped.")
     if status in {"unsupported", "contradicted", "needs_human_review"}:
-        parts.append("The claim should not be treated as investment-grade without analyst review.")
+        parts.append("Needs an analyst to check it before anyone relies on it.")
     return " ".join(parts)
 
 
@@ -457,8 +617,14 @@ def build_verified_evidence_graph(report_id: int) -> dict[str, Any]:
     effects = rows("SELECT * FROM effects WHERE report_id = ? ORDER BY id", (report_id,))
     source_docs = rows("SELECT * FROM source_docs WHERE catalyst_id = ? ORDER BY id", (catalyst_id,))
     source_by_id = {int(d["id"]): d for d in source_docs}
-    execute("DELETE FROM claim_evidence_spans WHERE claim_id IN (SELECT id FROM atomic_claims WHERE report_id = ?)", (report_id,))
-    execute("DELETE FROM claim_verification_summary WHERE claim_id IN (SELECT id FROM atomic_claims WHERE report_id = ?)", (report_id,))
+    execute(
+        "DELETE FROM claim_evidence_spans WHERE claim_id IN (SELECT id FROM atomic_claims WHERE report_id = ?)",
+        (report_id,),
+    )
+    execute(
+        "DELETE FROM claim_verification_summary WHERE claim_id IN (SELECT id FROM atomic_claims WHERE report_id = ?)",
+        (report_id,),
+    )
     execute("DELETE FROM atomic_claims WHERE report_id = ?", (report_id,))
 
     total = 0
@@ -513,17 +679,28 @@ def build_verified_evidence_graph(report_id: int) -> dict[str, Any]:
                         float(verdict.get("contradiction_score") or 0.0),
                         float(verdict.get("coverage_score") or 0.0),
                         "local_verified_evidence_graph_v1",
-                        json.dumps({
-                            "missing_elements": verdict.get("missing_elements") or [],
-                            "source_type_ok": verdict.get("source_type_ok"),
-                            "claim_type": claim_type,
-                        }, ensure_ascii=False),
+                        json.dumps(
+                            {
+                                "missing_elements": verdict.get("missing_elements") or [],
+                                "source_type_ok": verdict.get("source_type_ok"),
+                                "claim_type": claim_type,
+                            },
+                            ensure_ascii=False,
+                        ),
                     ),
                 )
-                score = float(verdict.get("entailment_score") or 0.0) - float(verdict.get("contradiction_score") or 0.0) + float(candidate.get("retrieval_score") or 0.0) * 0.15
+                score = (
+                    float(verdict.get("entailment_score") or 0.0)
+                    - float(verdict.get("contradiction_score") or 0.0)
+                    + float(candidate.get("retrieval_score") or 0.0) * 0.15
+                )
                 current_best_score = -1.0
                 if best_span:
-                    current_best_score = float(best_span.get("entailment_score") or 0.0) - float(best_span.get("contradiction_score") or 0.0) + float(best_span.get("retrieval_score") or 0.0) * 0.15
+                    current_best_score = (
+                        float(best_span.get("entailment_score") or 0.0)
+                        - float(best_span.get("contradiction_score") or 0.0)
+                        + float(best_span.get("retrieval_score") or 0.0) * 0.15
+                    )
                 if score > current_best_score:
                     best_span = {
                         "id": span_id,
@@ -565,7 +742,8 @@ def build_verified_evidence_graph(report_id: int) -> dict[str, Any]:
                 """
                 INSERT INTO claim_verification_summary (
                     claim_id, final_status, best_span_id, best_support_score, best_contradiction_score,
-                    required_source_type, has_required_source_type, confidence_cap, publishable, failure_reason, verified_at
+                    required_source_type, has_required_source_type, confidence_cap, publishable, failure_reason,
+                        verified_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -574,7 +752,9 @@ def build_verified_evidence_graph(report_id: int) -> dict[str, Any]:
                     best_span_id,
                     float(best_span.get("entailment_score") if best_span else 0.0),
                     best_contradiction,
-                    ",".join(sorted(SOURCE_REQUIREMENTS.get(claim_type, SOURCE_REQUIREMENTS["background_fact"])["preferred"])),
+                    ",".join(
+                        sorted(SOURCE_REQUIREMENTS.get(claim_type, SOURCE_REQUIREMENTS["background_fact"])["preferred"])
+                    ),
                     1 if best_source_type_ok else 0,
                     cap,
                     publishable,
@@ -609,14 +789,25 @@ def build_verified_evidence_graph(report_id: int) -> dict[str, Any]:
         cap = max(0.25, min(effect_caps))
         new_conf = min(_safe_float(current.get("confidence"), 0.4), cap)
         rationale = str(current.get("rationale") or "")
-        if "Verified Evidence Graph:" not in rationale and new_conf < _safe_float(current.get("confidence"), 0.4):
-            rationale = (rationale + f" Verified Evidence Graph: effect confidence capped at {cap:.2f} based on exact-span claim verification.").strip()
+        if "Claim check:" not in rationale and new_conf < _safe_float(current.get("confidence"), 0.4):
+            rationale = (
+                rationale
+                + f" Claim check: capped at {cap:.2f} by how well the exact source passages support the claims."
+            ).strip()
         execute("UPDATE effects SET confidence = ?, rationale = ? WHERE id = ?", (new_conf, rationale, effect_id))
 
     coverage = (verified + weak) / total if total else 0.0
     unsupported_rate = (unsupported + contradicted + needs_review) / total if total else 1.0
     avg_cap = sum(caps) / len(caps) if caps else 0.35
-    grade = "A" if coverage >= 0.95 and unsupported_rate == 0 and avg_cap >= 0.78 else "B" if coverage >= 0.85 and unsupported_rate <= 0.10 else "C" if coverage >= 0.65 else "D"
+    grade = (
+        "A"
+        if coverage >= 0.95 and unsupported_rate == 0 and avg_cap >= 0.78
+        else "B"
+        if coverage >= 0.85 and unsupported_rate <= 0.10
+        else "C"
+        if coverage >= 0.65
+        else "D"
+    )
     report_cap = {"A": 0.92, "B": 0.80, "C": 0.65, "D": 0.48}[grade]
     execute("UPDATE reports SET overall_confidence = MIN(overall_confidence, ?) WHERE id = ?", (report_cap, report_id))
     audit = row("SELECT * FROM analysis_audits WHERE report_id = ?", (report_id,))
@@ -632,24 +823,30 @@ def build_verified_evidence_graph(report_id: int) -> dict[str, Any]:
         "claim_publishable_coverage": round(coverage, 3),
         "average_confidence_cap": round(avg_cap, 3),
         "report_confidence_cap": report_cap,
-        "guardrail": "claims require exact stored source spans, paragraph IDs, character offsets, entailment labels, contradiction risk checks, source-type requirements, and confidence caps",
+        "guardrail": (
+            "claims require exact stored source spans, paragraph IDs, character offsets, entailment labels, "
+            "contradiction risk checks, source-type requirements, and confidence caps"
+        ),
     }
     if audit:
         try:
             payload = json.loads(audit.get("audit_json") or "{}")
-        except Exception:
+        except (TypeError, ValueError):
             payload = {}
         payload["verified_evidence_graph"] = veg_audit
         combined_grade = min(str(audit.get("evidence_grade") or "D"), grade)
         execute(
             """
             UPDATE analysis_audits
-            SET evidence_grade = ?, citation_coverage = ?, unsupported_effect_count = ?, weak_claim_count = ?, audit_json = ?
+            SET evidence_grade = ?, citation_coverage = ?, unsupported_effect_count = ?, weak_claim_count = ?,
+                audit_json = ?
             WHERE report_id = ?
             """,
             (
                 combined_grade,
-                min(_safe_float(audit.get("citation_coverage"), 0.0), coverage) if _safe_float(audit.get("citation_coverage"), 0.0) else coverage,
+                min(_safe_float(audit.get("citation_coverage"), 0.0), coverage)
+                if _safe_float(audit.get("citation_coverage"), 0.0)
+                else coverage,
                 int(audit.get("unsupported_effect_count") or 0) + unsupported + contradicted,
                 int(audit.get("weak_claim_count") or 0) + weak + needs_review,
                 json.dumps(payload, ensure_ascii=False),
@@ -659,10 +856,18 @@ def build_verified_evidence_graph(report_id: int) -> dict[str, Any]:
     else:
         execute(
             """
-            INSERT INTO analysis_audits (report_id, evidence_grade, citation_coverage, unsupported_effect_count, weak_claim_count, audit_json)
+            INSERT INTO analysis_audits (report_id, evidence_grade, citation_coverage, unsupported_effect_count,
+                weak_claim_count, audit_json)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (report_id, grade, coverage, unsupported + contradicted, weak + needs_review, json.dumps({"verified_evidence_graph": veg_audit}, ensure_ascii=False)),
+            (
+                report_id,
+                grade,
+                coverage,
+                unsupported + contradicted,
+                weak + needs_review,
+                json.dumps({"verified_evidence_graph": veg_audit}, ensure_ascii=False),
+            ),
         )
     if grade != "A":
         execute(
@@ -670,14 +875,18 @@ def build_verified_evidence_graph(report_id: int) -> dict[str, Any]:
             INSERT OR REPLACE INTO report_reviews (report_id, status, reviewer, notes, updated_at)
             VALUES (?, 'needs_review', '', ?, CURRENT_TIMESTAMP)
             """,
-            (report_id, "Verified Evidence Graph requires analyst review for weak/unsupported/contradicted claims."),
+            (
+                report_id,
+                "Some claims are weak, unsupported or contradicted by their sources. Check them before approving.",
+            ),
         )
     return veg_audit
 
 
 def evidence_graph_for_report(report_id: int) -> dict[str, Any]:
-    summary = row(
-        """
+    summary = (
+        row(
+            """
         SELECT COUNT(*) AS total,
                SUM(CASE WHEN cvs.final_status = 'verified' THEN 1 ELSE 0 END) AS verified,
                SUM(CASE WHEN cvs.final_status = 'weakly_verified' THEN 1 ELSE 0 END) AS weak,
@@ -689,8 +898,10 @@ def evidence_graph_for_report(report_id: int) -> dict[str, Any]:
         LEFT JOIN claim_verification_summary cvs ON cvs.claim_id = ac.id
         WHERE ac.report_id = ?
         """,
-        (report_id,),
-    ) or {}
+            (report_id,),
+        )
+        or {}
+    )
     claims = rows(
         """
         SELECT ac.*, cvs.final_status, cvs.best_support_score, cvs.best_contradiction_score,

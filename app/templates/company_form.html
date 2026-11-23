@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Add company · Catalyst Propagation{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <a class="back" href="/watchlist">Watchlist</a>
+    <h1>Add company</h1>
+    <p class="lede">Separate multiple values with commas or new lines.</p>
+  </div>
+</div>
+
+<form action="/forms/company" method="post" class="form">
+  <div class="row">
+    <label>Company name <input name="name" required maxlength="200" placeholder="Madrigal Pharmaceuticals"></label>
+    <label>Ticker <input name="ticker" maxlength="12" placeholder="MDGL"></label>
+  </div>
+  <label>Drug names and aliases <textarea name="aliases" rows="2" placeholder="Rezdiffra, resmetirom"></textarea></label>
+  <label>Targets <textarea name="targets" rows="2" placeholder="THR-beta"></textarea></label>
+  <label>Indications <textarea name="indications" rows="2" placeholder="MASH"></textarea></label>
+  <label>Investor relations or news URLs <textarea name="source_urls" rows="2" placeholder="https://ir.madrigalpharma.com/news-releases"></textarea></label>
+  <label>Notes <textarea name="notes" rows="2" placeholder="What should the monitor watch for?"></textarea></label>
+  <details>
+    <summary>Peers (JSON)</summary>
+    <p class="hint">A list of objects with <code>company</code>, <code>ticker</code>, <code>relationship</code>, <code>target</code>, <code>indication</code> and an <code>evidence_url</code> that shows the relationship.</p>
+    <textarea name="peers_json" class="code" rows="10">[
+  {
+    "company": "Viking Therapeutics",
+    "ticker": "VKTX",
+    "relationship": "same target, same indication",
+    "target": "THR-beta",
+    "indication": "MASH",
+    "evidence_url": "https://vikingtherapeutics.com/pipeline/vk2809/"
+  }
+]</textarea>
+  </details>
+  <div class="actions"><button class="btn primary">Add company</button></div>
+</form>
+{% endblock %}

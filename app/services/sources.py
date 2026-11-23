@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import logging
 import re
+import socket
+import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import httpx
@@ -12,7 +16,16 @@ from bs4 import BeautifulSoup
 
 from app.config import settings
 from app.db import execute, row
-from app.services.utils import clean_text, classify_catalyst, is_likely_catalyst, normalize_url, source_key
+from app.services.utils import (
+    classify_catalyst,
+    clean_text,
+    is_likely_catalyst,
+    normalize_url,
+    redact_secrets,
+    source_key,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -20,7 +33,7 @@ class SourceDocumentCandidate:
     title: str
     url: str
     publisher: str
-    published_at: Optional[str]
+    published_at: str | None
     excerpt: str
     source_type: str
     company_name: str
@@ -28,8 +41,6 @@ class SourceDocumentCandidate:
 
     @property
     def key(self) -> str:
-        
-        
         return source_key(self.source_type, self.url or self.title, self.published_at or "")
 
     def to_dict(self) -> dict[str, Any]:
@@ -37,7 +48,8 @@ class SourceDocumentCandidate:
 
 
 class SourceFetchError(Exception):
-    pass
+    def __init__(self, message: str) -> None:
+        super().__init__(redact_secrets(str(message)))
 
 
 def _headers(accept_html: bool = True) -> dict[str, str]:
@@ -48,15 +60,15 @@ def _headers(accept_html: bool = True) -> dict[str, str]:
     }
 
 
-def _parse_cache_time(value: Optional[str]) -> Optional[datetime]:
+def _parse_cache_time(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
         raw = value.replace("Z", "+00:00").replace(" ", "T")
         dt = datetime.fromisoformat(raw)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
     except Exception:
         return None
 
@@ -65,17 +77,18 @@ def _cache_key(url: str) -> str:
     return source_key("url_text", normalize_url(url) or url)
 
 
-def _cache_get(url: str) -> Optional[str]:
+def _cache_get(url: str) -> str | None:
     try:
         item = row("SELECT payload_json, expires_at FROM source_cache WHERE cache_key = ?", (_cache_key(url),))
         if not item:
             return None
         expires = _parse_cache_time(item.get("expires_at"))
-        if expires and expires < datetime.now(timezone.utc):
+        if expires and expires < datetime.now(UTC):
             return None
         payload = json.loads(item.get("payload_json") or "{}")
         return payload.get("text")
     except Exception:
+        logger.warning("Source cache read failed for %s", url, exc_info=True)
         return None
 
 
@@ -84,11 +97,12 @@ def _cache_put(url: str, source_name: str, text: str) -> None:
         ttl = max(int(settings.source_cache_ttl_seconds), 0)
         if ttl <= 0:
             return
-        now = datetime.now(timezone.utc).replace(microsecond=0)
+        now = datetime.now(UTC).replace(microsecond=0)
         expires = now + timedelta(seconds=ttl)
         execute(
             """
-            INSERT OR REPLACE INTO source_cache (cache_key, source_name, url, content_hash, payload_json, fetched_at, expires_at)
+            INSERT OR REPLACE INTO source_cache (cache_key, source_name, url, content_hash, payload_json, fetched_at,
+                expires_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -102,28 +116,74 @@ def _cache_put(url: str, source_name: str, text: str) -> None:
             ),
         )
     except Exception:
-        pass
+        logger.warning("Source cache write failed for %s", url, exc_info=True)
 
 
-def fetch_url_text(url: str, timeout: Optional[float] = None, use_scraperapi: bool = True) -> str:
-    """Fetch a page directly, or through ScraperAPI when configured.
+MAX_FETCH_BYTES = 2_000_000
+DRUGS_AT_FDA_OVERVIEW = "https://www.accessdata.fda.gov/scripts/cder/daf/index.cfm?event=overview.process&ApplNo="
+MAX_REDIRECTS = 5
 
-    A short SQLite cache saves repeated dashboard/manual monitor runs from
-    re-fetching the same official pages over and over. Cache failure is ignored
-    so network fetching still works in clean installs or tests.
-    """
+
+def assert_public_url(url: str) -> None:
+    parts = urlparse(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise SourceFetchError(f"Refusing non-http URL: {url[:200]}")
+    if parts.port not in {None, 80, 443}:
+        raise SourceFetchError(f"Refusing non-standard port: {url[:200]}")
+    try:
+        infos = socket.getaddrinfo(parts.hostname, parts.port or 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise SourceFetchError(f"Could not resolve {parts.hostname}") from exc
+    for info in infos:
+        if not ipaddress.ip_address(info[4][0]).is_global:
+            raise SourceFetchError(f"Refusing private or internal address for {parts.hostname}")
+
+
+def _read_capped(resp: httpx.Response, deadline: float) -> str:
+    if int(resp.headers.get("content-length") or 0) > MAX_FETCH_BYTES:
+        raise SourceFetchError(f"Response too large from {resp.request.url.host}")
+    chunks: list[bytes] = []
+    size = 0
+    for chunk in resp.iter_bytes():
+        size += len(chunk)
+        if size > MAX_FETCH_BYTES:
+            raise SourceFetchError(f"Response too large from {resp.request.url.host}")
+        if time.monotonic() > deadline:
+            raise SourceFetchError(f"Timed out reading {resp.request.url.host}")
+        chunks.append(chunk)
+    return b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+
+
+def fetch_url_text(url: str, timeout: float | None = None, use_scraperapi: bool = True) -> str:
     cached = _cache_get(url)
     if cached is not None:
         return cached
-    target = url
-    if use_scraperapi and settings.scraperapi_api_key:
-        target = "https://api.scraperapi.com/" + f"?api_key={settings.scraperapi_api_key}&url={quote_plus(url)}"
-    with httpx.Client(timeout=timeout or settings.request_timeout_seconds, follow_redirects=True, headers=_headers()) as client:
-        resp = client.get(target)
-        resp.raise_for_status()
-        text = resp.text
-        _cache_put(url, "url_text", text)
-        return text
+    limit = timeout or settings.request_timeout_seconds
+    deadline = time.monotonic() + limit * 2
+    assert_public_url(url)
+    with httpx.Client(timeout=limit, follow_redirects=False, headers=_headers()) as client:
+        if use_scraperapi and settings.scraperapi_api_key:
+            params = {"api_key": settings.scraperapi_api_key, "url": url}
+            with client.stream("GET", "https://api.scraperapi.com/", params=params) as resp:
+                if resp.status_code >= 400:
+                    raise SourceFetchError(f"ScraperAPI returned HTTP {resp.status_code} for {url[:200]}")
+                text = _read_capped(resp, deadline)
+        else:
+            target = url
+            for _ in range(MAX_REDIRECTS + 1):
+                with client.stream("GET", target) as resp:
+                    if resp.is_redirect and resp.headers.get("location"):
+                        target = urljoin(target, resp.headers["location"])
+                        assert_public_url(target)
+                        continue
+                    if resp.status_code >= 400:
+                        raise SourceFetchError(f"HTTP {resp.status_code} for {url[:200]}")
+                    text = _read_capped(resp, deadline)
+                    break
+            else:
+                raise SourceFetchError(f"Too many redirects for {url[:200]}")
+    _cache_put(url, "url_text", text)
+    return text
 
 
 def company_search_terms(company: dict[str, Any]) -> list[str]:
@@ -145,7 +205,7 @@ def company_search_terms(company: dict[str, Any]) -> list[str]:
 def _domain(url: str) -> str:
     try:
         return urlparse(url).netloc.replace("www.", "") or "source"
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         return "source"
 
 
@@ -167,9 +227,26 @@ def _relevant_excerpt(text: str, fallback: str, window: int = 420) -> str:
     cleaned = clean_text(text, 5000)
     low = cleaned.lower()
     keywords = [
-        "phase", "trial", "topline", "endpoint", "fda", "approval", "complete response letter",
-        "pdufa", "license", "collaboration", "upfront", "milestone", "royalt", "acquire",
-        "acquisition", "merger", "tender offer", "clinical hold", "terminated", "discontinued",
+        "phase",
+        "trial",
+        "topline",
+        "endpoint",
+        "fda",
+        "approval",
+        "complete response letter",
+        "pdufa",
+        "license",
+        "collaboration",
+        "upfront",
+        "milestone",
+        "royalt",
+        "acquire",
+        "acquisition",
+        "merger",
+        "tender offer",
+        "clinical hold",
+        "terminated",
+        "discontinued",
     ]
     positions = [low.find(k) for k in keywords if low.find(k) >= 0]
     if not positions:
@@ -181,8 +258,6 @@ def _relevant_excerpt(text: str, fallback: str, window: int = 420) -> str:
 
 
 class CompanyNewsSource:
-    """User-defined company IR/news pages or RSS feeds."""
-
     name = "company_news"
 
     def fetch(self, company: dict[str, Any], limit: int = 6) -> list[SourceDocumentCandidate]:
@@ -191,12 +266,14 @@ class CompanyNewsSource:
         for source_url in urls[:4]:
             try:
                 html_text = fetch_url_text(source_url)
-            except Exception as exc:  
+            except Exception as exc:
                 raise SourceFetchError(f"Company news fetch failed for {source_url}: {exc}") from exc
-            soup = BeautifulSoup(html_text, "xml" if "<rss" in html_text[:500].lower() or "<feed" in html_text[:500].lower() else "html.parser")
-            candidates: list[tuple[str, str, Optional[str]]] = []
+            soup = BeautifulSoup(
+                html_text,
+                "xml" if "<rss" in html_text[:500].lower() or "<feed" in html_text[:500].lower() else "html.parser",
+            )
+            candidates: list[tuple[str, str, str | None]] = []
 
-            
             for item in soup.find_all(["item", "entry"]):
                 title = clean_text(item.find("title").get_text(" ") if item.find("title") else "", 250)
                 link_tag = item.find("link")
@@ -208,7 +285,6 @@ class CompanyNewsSource:
                 if title and href:
                     candidates.append((title, urljoin(source_url, href), published))
 
-            
             if not candidates:
                 for a in soup.find_all("a", href=True):
                     title = clean_text(a.get_text(" "), 250)
@@ -233,16 +309,18 @@ class CompanyNewsSource:
                         continue
                 except Exception:
                     pass
-                docs.append(SourceDocumentCandidate(
-                    title=final_title,
-                    url=normalized,
-                    publisher=_domain(normalized),
-                    published_at=published,
-                    excerpt=excerpt,
-                    source_type=self.name,
-                    company_name=company.get("name", ""),
-                    raw={"source_url": source_url},
-                ))
+                docs.append(
+                    SourceDocumentCandidate(
+                        title=final_title,
+                        url=normalized,
+                        publisher=_domain(normalized),
+                        published_at=published,
+                        excerpt=excerpt,
+                        source_type=self.name,
+                        company_name=company.get("name", ""),
+                        raw={"source_url": source_url},
+                    )
+                )
                 if len(docs) >= limit:
                     return docs
         return docs
@@ -256,22 +334,35 @@ class GDELTSource:
         if not terms:
             return []
         company_part = " OR ".join(f'"{t}"' if " " in t else t for t in terms)
-        catalyst_part = " OR ".join([
-            '"trial results"', '"topline"', '"FDA approves"', '"complete response letter"',
-            '"PDUFA"', '"license agreement"', '"strategic collaboration"', '"to acquire"', '"acquisition"',
-            '"clinical hold"', '"phase 3"', '"phase 2"',
-        ])
+        catalyst_part = " OR ".join(
+            [
+                '"trial results"',
+                '"topline"',
+                '"FDA approves"',
+                '"complete response letter"',
+                '"PDUFA"',
+                '"license agreement"',
+                '"strategic collaboration"',
+                '"to acquire"',
+                '"acquisition"',
+                '"clinical hold"',
+                '"phase 3"',
+                '"phase 2"',
+            ]
+        )
         query = f"({company_part}) ({catalyst_part}) sourcelang:English"
         url = (
             "https://api.gdeltproject.org/api/v2/doc/doc"
             f"?query={quote_plus(query)}&mode=ArtList&format=json&maxrecords={limit * 2}&sort=HybridRel"
         )
         try:
-            with httpx.Client(timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers()) as client:
+            with httpx.Client(
+                timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers()
+            ) as client:
                 resp = client.get(url)
                 resp.raise_for_status()
                 data = resp.json()
-        except Exception as exc:  
+        except Exception as exc:
             raise SourceFetchError(f"GDELT fetch failed: {exc}") from exc
 
         docs: list[SourceDocumentCandidate] = []
@@ -280,16 +371,18 @@ class GDELTSource:
             excerpt = clean_text(f"{article.get('seendate', '')} {article.get('sourceCountry', '')}", 500)
             if not title or not is_likely_catalyst(title, excerpt):
                 continue
-            docs.append(SourceDocumentCandidate(
-                title=title,
-                url=normalize_url(article.get("url", "")),
-                publisher=article.get("domain", "GDELT"),
-                published_at=article.get("seendate"),
-                excerpt=excerpt or title,
-                source_type=self.name,
-                company_name=company.get("name", ""),
-                raw=article,
-            ))
+            docs.append(
+                SourceDocumentCandidate(
+                    title=title,
+                    url=normalize_url(article.get("url", "")),
+                    publisher=article.get("domain", "GDELT"),
+                    published_at=article.get("seendate"),
+                    excerpt=excerpt or title,
+                    source_type=self.name,
+                    company_name=company.get("name", ""),
+                    raw=article,
+                )
+            )
             if len(docs) >= limit:
                 break
         return docs
@@ -308,11 +401,13 @@ class ClinicalTrialsSource:
             f"?query.term={quote_plus(query)}&pageSize={min(limit * 3, 100)}&format=json"
         )
         try:
-            with httpx.Client(timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers()) as client:
+            with httpx.Client(
+                timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers()
+            ) as client:
                 resp = client.get(url)
                 resp.raise_for_status()
                 data = resp.json()
-        except Exception as exc:  
+        except Exception as exc:
             raise SourceFetchError(f"ClinicalTrials.gov fetch failed: {exc}") from exc
 
         docs: list[SourceDocumentCandidate] = []
@@ -329,7 +424,9 @@ class ClinicalTrialsSource:
             last_update = status.get("lastUpdateSubmitDate") or status.get("lastUpdatePostDateStruct", {}).get("date")
             has_results = bool(study.get("resultsSection"))
             phases = ", ".join(design.get("phases", []) or [])
-            interventions = ", ".join(item.get("name", "") for item in arms.get("interventions", []) if item.get("name"))
+            interventions = ", ".join(
+                item.get("name", "") for item in arms.get("interventions", []) if item.get("name")
+            )
             org = sponsor.get("leadSponsor", {}).get("name", "")
             if not has_results and overall_status.lower() not in {"completed", "terminated", "withdrawn", "suspended"}:
                 continue
@@ -340,16 +437,18 @@ class ClinicalTrialsSource:
                 f"Results posted: {has_results}.",
                 900,
             )
-            docs.append(SourceDocumentCandidate(
-                title=title,
-                url=f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else "https://clinicaltrials.gov/",
-                publisher="ClinicalTrials.gov",
-                published_at=last_update,
-                excerpt=excerpt,
-                source_type=self.name,
-                company_name=company.get("name", ""),
-                raw=study,
-            ))
+            docs.append(
+                SourceDocumentCandidate(
+                    title=title,
+                    url=f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else "https://clinicaltrials.gov/",
+                    publisher="ClinicalTrials.gov",
+                    published_at=last_update,
+                    excerpt=excerpt,
+                    source_type=self.name,
+                    company_name=company.get("name", ""),
+                    raw=study,
+                )
+            )
             if len(docs) >= limit:
                 break
         return docs
@@ -364,7 +463,7 @@ class FDAPressSource:
         target_terms = [str(x).lower() for x in company.get("targets", []) + company.get("indications", [])]
         try:
             html_text = fetch_url_text(self.index_url, use_scraperapi=False)
-        except Exception as exc:  
+        except Exception as exc:
             raise SourceFetchError(f"FDA page fetch failed: {exc}") from exc
         soup = BeautifulSoup(html_text, "html.parser")
         docs: list[SourceDocumentCandidate] = []
@@ -378,36 +477,30 @@ class FDAPressSource:
             if classify_catalyst(text) not in {"fda_decision", "other_catalyst"} and "fda" not in low:
                 continue
             href = urljoin("https://www.fda.gov", a["href"])
-            docs.append(SourceDocumentCandidate(
-                title=text,
-                url=normalize_url(href),
-                publisher="FDA",
-                published_at=None,
-                excerpt=text,
-                source_type=self.name,
-                company_name=company.get("name", ""),
-                raw={"index_url": self.index_url},
-            ))
+            docs.append(
+                SourceDocumentCandidate(
+                    title=text,
+                    url=normalize_url(href),
+                    publisher="FDA",
+                    published_at=None,
+                    excerpt=text,
+                    source_type=self.name,
+                    company_name=company.get("name", ""),
+                    raw={"index_url": self.index_url},
+                )
+            )
             if len(docs) >= limit:
                 break
         return docs
 
 
 class OpenFDADrugsSource:
-    """Drugs@FDA approval/submission discovery through the official openFDA endpoint.
-
-    This is used as a high-precision regulatory source. It is intentionally
-    conservative: it only emits candidate catalysts when the application record
-    has an approval-looking submission status/date tied to a sponsor or product
-    alias from the watchlist.
-    """
-
     name = "openfda_drugs"
     endpoint = "https://api.fda.gov/drug/drugsfda.json"
 
     def _queries(self, company: dict[str, Any]) -> list[str]:
         terms = company_search_terms(company)
-        
+
         product_terms = [str(x) for x in (company.get("aliases") or [])[:5]]
         queries: list[str] = []
         for term in terms[:4]:
@@ -418,7 +511,7 @@ class OpenFDADrugsSource:
             safe = str(term).replace('"', "").strip()
             if safe:
                 queries.append(f'products.brand_name:"{safe}"')
-        
+
         out: list[str] = []
         seen: set[str] = set()
         for q in queries:
@@ -432,74 +525,96 @@ class OpenFDADrugsSource:
         for query in self._queries(company):
             url = f"{self.endpoint}?search={quote_plus(query)}&limit={min(max(limit, 1) * 2, 20)}"
             try:
-                with httpx.Client(timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers(False)) as client:
+                with httpx.Client(
+                    timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers(False)
+                ) as client:
                     resp = client.get(url)
                     if resp.status_code == 404:
                         continue
                     resp.raise_for_status()
                     data = resp.json()
-            except Exception as exc:  
+            except Exception as exc:
                 raise SourceFetchError(f"openFDA Drugs@FDA fetch failed: {exc}") from exc
 
             for record in data.get("results", [])[: limit * 2]:
                 sponsor = clean_text(record.get("sponsor_name", ""), 160)
                 application = clean_text(record.get("application_number", ""), 80)
                 products = record.get("products") or []
-                product_names = sorted({clean_text(p.get("brand_name") or p.get("active_ingredients", [{}])[0].get("name", ""), 80) for p in products if p})
+                product_names = sorted(
+                    {
+                        clean_text(p.get("brand_name") or p.get("active_ingredients", [{}])[0].get("name", ""), 80)
+                        for p in products
+                        if p
+                    }
+                )
                 submissions = record.get("submissions") or []
-                
-                submissions = sorted(submissions, key=lambda x: str(x.get("submission_status_date") or ""), reverse=True)
+
+                submissions = sorted(
+                    submissions, key=lambda x: str(x.get("submission_status_date") or ""), reverse=True
+                )
                 for sub in submissions[:4]:
                     status = clean_text(str(sub.get("submission_status") or ""), 80)
                     status_date = clean_text(str(sub.get("submission_status_date") or ""), 30) or None
                     submission_type = clean_text(str(sub.get("submission_type") or ""), 60)
                     review_priority = clean_text(str(sub.get("review_priority") or ""), 80)
                     label = " ".join([status, submission_type, review_priority]).lower()
-                    
+
                     if not any(x in label for x in ["ap", "approval", "approved", "priority"]):
                         continue
                     product = ", ".join([p for p in product_names if p]) or application or company.get("name", "Drug")
                     title = f"Drugs@FDA {status or 'submission'} for {product} ({application})"
                     excerpt = clean_text(
-                        f"openFDA Drugs@FDA record for sponsor {sponsor or 'not listed'}, application {application or 'not listed'}, "
-                        f"product {product}. Submission type {submission_type or 'not listed'}; status {status or 'not listed'}; "
-                        f"status date {status_date or 'not listed'}; review priority {review_priority or 'not listed'}.",
+                        f"openFDA Drugs@FDA record for sponsor {sponsor or 'not listed'}, application "
+                        f"{application or 'not listed'}, "
+                        f"product {product}. Submission type {submission_type or 'not listed'}; status "
+                        f"{status or 'not listed'}; "
+                        f"status date {status_date or 'not listed'}; review priority "
+                        f"{review_priority or 'not listed'}.",
                         900,
                     )
-                    docs.append(SourceDocumentCandidate(
-                        title=title,
-                        url=f"https://www.accessdata.fda.gov/scripts/cder/daf/index.cfm?event=overview.process&ApplNo={application.replace('NDA', '').replace('BLA', '')}" if application else "https://open.fda.gov/apis/drug/drugsfda/",
-                        publisher="openFDA / Drugs@FDA",
-                        published_at=status_date,
-                        excerpt=excerpt,
-                        source_type=self.name,
-                        company_name=company.get("name", ""),
-                        raw={"query": query, "application_number": application, "submission": sub, "sponsor_name": sponsor},
-                    ))
+                    appl_no = application.replace("NDA", "").replace("BLA", "")
+                    url = (
+                        f"{DRUGS_AT_FDA_OVERVIEW}{appl_no}"
+                        if application
+                        else "https://open.fda.gov/apis/drug/drugsfda/"
+                    )
+                    docs.append(
+                        SourceDocumentCandidate(
+                            title=title,
+                            url=url,
+                            publisher="openFDA / Drugs@FDA",
+                            published_at=status_date,
+                            excerpt=excerpt,
+                            source_type=self.name,
+                            company_name=company.get("name", ""),
+                            raw={
+                                "query": query,
+                                "application_number": application,
+                                "submission": sub,
+                                "sponsor_name": sponsor,
+                            },
+                        )
+                    )
                     if len(docs) >= limit:
                         return docs
         return docs
 
 
 class PubMedSource:
-    """PubMed literature context for target/indication validation.
-
-    PubMed is not a company-news feed, so the scheduler score usually gates it
-    unless a paper title/excerpt includes catalyst-like terms. When it passes,
-    it gives the analysis a citable biomedical source for target or indication
-    reasoning instead of relying only on press-release language.
-    """
-
     name = "pubmed"
     search_endpoint = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     summary_endpoint = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
     def fetch(self, company: dict[str, Any], limit: int = 6) -> list[SourceDocumentCandidate]:
-        terms = [*(company.get("targets") or [])[:3], *(company.get("indications") or [])[:3], *(company.get("aliases") or [])[:3]]
+        terms = [
+            *(company.get("targets") or [])[:3],
+            *(company.get("indications") or [])[:3],
+            *(company.get("aliases") or [])[:3],
+        ]
         terms = [clean_text(t, 120) for t in terms if clean_text(t, 120)]
         if not terms:
             return []
-        catalyst_terms = '(clinical trial OR phase 2 OR phase 3 OR endpoint OR efficacy OR safety OR FDA OR approval)'
+        catalyst_terms = "(clinical trial OR phase 2 OR phase 3 OR endpoint OR efficacy OR safety OR FDA OR approval)"
         query = " OR ".join(f'"{t}"' if " " in t else t for t in terms[:6])
         params = {
             "db": "pubmed",
@@ -509,16 +624,20 @@ class PubMedSource:
             "sort": "pub+date",
         }
         try:
-            with httpx.Client(timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers(False)) as client:
+            with httpx.Client(
+                timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers(False)
+            ) as client:
                 search = client.get(self.search_endpoint, params=params)
                 search.raise_for_status()
                 ids = search.json().get("esearchresult", {}).get("idlist", [])
                 if not ids:
                     return []
-                summary = client.get(self.summary_endpoint, params={"db": "pubmed", "id": ",".join(ids), "retmode": "json"})
+                summary = client.get(
+                    self.summary_endpoint, params={"db": "pubmed", "id": ",".join(ids), "retmode": "json"}
+                )
                 summary.raise_for_status()
                 data = summary.json().get("result", {})
-        except Exception as exc:  
+        except Exception as exc:
             raise SourceFetchError(f"PubMed fetch failed: {exc}") from exc
 
         docs: list[SourceDocumentCandidate] = []
@@ -532,19 +651,22 @@ class PubMedSource:
             authors = item.get("authors") or []
             first_author = clean_text(authors[0].get("name", ""), 80) if authors else ""
             excerpt = clean_text(
-                f"PubMed record PMID {pmid}. Journal: {journal}. Publication date: {pubdate or 'not listed'}. First author: {first_author or 'not listed'}. Title: {title}",
+                f"PubMed record PMID {pmid}. Journal: {journal}. Publication date: "
+                f"{pubdate or 'not listed'}. First author: {first_author or 'not listed'}. Title: {title}",
                 900,
             )
-            docs.append(SourceDocumentCandidate(
-                title=title,
-                url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-                publisher=f"PubMed / {journal}",
-                published_at=pubdate,
-                excerpt=excerpt,
-                source_type=self.name,
-                company_name=company.get("name", ""),
-                raw={"pmid": pmid, "query": params["term"]},
-            ))
+            docs.append(
+                SourceDocumentCandidate(
+                    title=title,
+                    url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                    publisher=f"PubMed / {journal}",
+                    published_at=pubdate,
+                    excerpt=excerpt,
+                    source_type=self.name,
+                    company_name=company.get("name", ""),
+                    raw={"pmid": pmid, "query": params["term"]},
+                )
+            )
             if len(docs) >= limit:
                 break
         return docs
@@ -554,10 +676,12 @@ class SECSource:
     name = "sec_edgar"
     tickers_url = "https://www.sec.gov/files/company_tickers.json"
 
-    def _lookup_cik(self, ticker: str) -> Optional[str]:
+    def _lookup_cik(self, ticker: str) -> str | None:
         if not ticker:
             return None
-        with httpx.Client(timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers(False)) as client:
+        with httpx.Client(
+            timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers(False)
+        ) as client:
             resp = client.get(self.tickers_url)
             resp.raise_for_status()
             data = resp.json()
@@ -573,11 +697,13 @@ class SECSource:
             if not cik:
                 return []
             url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-            with httpx.Client(timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers(False)) as client:
+            with httpx.Client(
+                timeout=settings.request_timeout_seconds, follow_redirects=True, headers=_headers(False)
+            ) as client:
                 resp = client.get(url)
                 resp.raise_for_status()
                 data = resp.json()
-        except Exception as exc:  
+        except Exception as exc:
             raise SourceFetchError(f"SEC fetch failed: {exc}") from exc
 
         recent = data.get("filings", {}).get("recent", {})
@@ -587,7 +713,9 @@ class SECSource:
         primary_docs = recent.get("primaryDocument", [])
         items = recent.get("items", [])
         docs: list[SourceDocumentCandidate] = []
-        for form, filing_date, accession, primary_doc, item in zip(forms, dates, accessions, primary_docs, items):
+        for form, filing_date, accession, primary_doc, item in zip(
+            forms, dates, accessions, primary_docs, items, strict=False
+        ):
             if form not in {"8-K", "425", "SC TO-T", "S-4"}:
                 continue
             compact_accession = accession.replace("-", "")
@@ -607,21 +735,30 @@ class SECSource:
             except Exception:
                 if form == "8-K" and not re.search(r"1\.01|2\.01|8\.01", str(item or "")):
                     continue
-            docs.append(SourceDocumentCandidate(
-                title=title,
-                url=filing_url,
-                publisher="SEC EDGAR",
-                published_at=filing_date,
-                excerpt=excerpt,
-                source_type=self.name,
-                company_name=company.get("name", ""),
-                raw={"cik": cik, "accession": accession, "form": form, "item": item},
-            ))
+            docs.append(
+                SourceDocumentCandidate(
+                    title=title,
+                    url=filing_url,
+                    publisher="SEC EDGAR",
+                    published_at=filing_date,
+                    excerpt=excerpt,
+                    source_type=self.name,
+                    company_name=company.get("name", ""),
+                    raw={"cik": cik, "accession": accession, "form": form, "item": item},
+                )
+            )
             if len(docs) >= limit:
                 break
         return docs
 
 
 def all_sources() -> list[Any]:
-    
-    return [CompanyNewsSource(), SECSource(), FDAPressSource(), OpenFDADrugsSource(), ClinicalTrialsSource(), PubMedSource(), GDELTSource()]
+    return [
+        CompanyNewsSource(),
+        SECSource(),
+        FDAPressSource(),
+        OpenFDADrugsSource(),
+        ClinicalTrialsSource(),
+        PubMedSource(),
+        GDELTSource(),
+    ]

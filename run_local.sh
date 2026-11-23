@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
@@ -8,17 +8,12 @@ if [ ! -d ".venv" ]; then
 fi
 
 source .venv/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
+python -m pip install --quiet --upgrade pip
+python -m pip install --quiet -r requirements.txt
 
 if [ ! -f ".env" ]; then
-  if [ -f ".env.example" ]; then
-    cp .env.example .env
-  elif [ -f "env.example" ]; then
-    cp env.example .env
-  fi
+  cp .env.example .env
 fi
 
 echo "Starting Catalyst Propagation at http://127.0.0.1:8000"
-echo "OpenAI check: after adding OPENAI_API_KEY to .env, run: python scripts/check_openai_key.py"
-uvicorn app.main:app --reload
+exec uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload

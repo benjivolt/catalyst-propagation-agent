@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Watchlist · Catalyst Propagation{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Watchlist</h1>
+    <p class="lede">Companies the monitor checks. Targets, indications and peers drive the read-through analysis.</p>
+  </div>
+  <div class="actions">
+    {% if not companies %}<form action="/forms/seed" method="post"><button class="btn">Load sample watchlist</button></form>{% endif %}
+    <a class="btn primary" href="/watchlist/new">Add company</a>
+  </div>
+</div>
+
+{% if companies %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Company</th><th>Targets</th><th>Indications</th><th class="num">Peers</th><th class="num">Sources</th><th></th></tr></thead>
+    <tbody>
+      {% for c in companies %}
+      <tr>
+        <td>
+          <a href="/company/{{ c.id }}">{{ c.name }}</a>{% if c.ticker %} <span class="ticker">{{ c.ticker }}</span>{% endif %}
+          {% if not c.active %}<div class="sub">Paused</div>{% endif %}
+        </td>
+        <td>{{ c.targets[:3]|join(', ') or '—' }}</td>
+        <td>{{ c.indications[:3]|join(', ') or '—' }}</td>
+        <td class="num">{{ c.peers|length }}</td>
+        <td class="num">{{ c.source_urls|length }}</td>
+        <td class="right">
+          <form action="/forms/company/{{ c.id }}/delete" method="post" data-confirm="Delete {{ c.name }} and its catalysts?">
+            <button class="btn small quiet">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<section class="empty">
+  <h2>Your watchlist is empty</h2>
+  <p>Add a company you follow, or load the sample list of MASH, obesity and oncology names.</p>
+</section>
+{% endif %}
+{% endblock %}

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-import json
+import logging
 import sqlite3
-from datetime import datetime, timezone
+import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Optional, Iterable
+from typing import Any
 
 from app.config import settings
+from app.services.utils import json_loads
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -70,6 +75,7 @@ CREATE TABLE IF NOT EXISTS reports (
     plain_language_summary TEXT NOT NULL,
     raw_json TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(catalyst_id) REFERENCES catalysts(id) ON DELETE CASCADE
 );
 
@@ -82,6 +88,7 @@ CREATE TABLE IF NOT EXISTS effects (
     confidence REAL NOT NULL,
     readthrough_type TEXT NOT NULL DEFAULT 'none',
     rationale TEXT NOT NULL,
+    cap_notes TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(report_id) REFERENCES reports(id) ON DELETE CASCADE
 );
 
@@ -223,6 +230,7 @@ CREATE TABLE IF NOT EXISTS monitor_runs (
     finished_at TEXT,
     status TEXT NOT NULL,
     message TEXT,
+    mode TEXT NOT NULL DEFAULT '',
     new_catalysts INTEGER NOT NULL DEFAULT 0
 );
 
@@ -630,16 +638,6 @@ CREATE TABLE IF NOT EXISTS peer_effect_outcomes (
     FOREIGN KEY(effect_id) REFERENCES effects(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS ai_learning_notes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    note_type TEXT NOT NULL,
-    title TEXT NOT NULL,
-    body TEXT NOT NULL,
-    severity REAL NOT NULL DEFAULT 0.5,
-    raw_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
 CREATE INDEX IF NOT EXISTS idx_report_reviews_status ON report_reviews(status);
 CREATE INDEX IF NOT EXISTS idx_alert_deliveries_report ON alert_deliveries(report_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_catalyst ON llm_usage(catalyst_id, created_at);
@@ -648,13 +646,17 @@ CREATE INDEX IF NOT EXISTS idx_source_correlations_catalyst ON source_correlatio
 CREATE INDEX IF NOT EXISTS idx_source_health_company ON source_health(company_id, source_name, updated_at);
 CREATE INDEX IF NOT EXISTS idx_peer_asset_index_target ON peer_asset_index(target, indication, company_name);
 
-CREATE INDEX IF NOT EXISTS idx_ai_predictions_status ON ai_predictions(outcome_status, current_outcome_label, created_at);
-CREATE INDEX IF NOT EXISTS idx_ai_predictions_source_event ON ai_predictions(source_type, predicted_event_type, company_id);
+CREATE INDEX IF NOT EXISTS idx_ai_predictions_status ON ai_predictions(outcome_status, current_outcome_label,
+    created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_predictions_source_event ON ai_predictions(source_type, predicted_event_type,
+    company_id);
 CREATE INDEX IF NOT EXISTS idx_ai_outcome_checks_due ON ai_prediction_outcome_checks(status, due_at);
 CREATE INDEX IF NOT EXISTS idx_prediction_outcomes_prediction ON prediction_outcomes(prediction_id, checked_at);
-CREATE INDEX IF NOT EXISTS idx_source_reputation_lookup ON source_reputation(source_type, event_type, company_id, reliability_score);
+CREATE INDEX IF NOT EXISTS idx_source_reputation_lookup ON source_reputation(source_type, event_type, company_id,
+    reliability_score);
 CREATE INDEX IF NOT EXISTS idx_gate_policy_lookup ON gate_policy_thresholds(source_type, event_type, company_id);
-CREATE INDEX IF NOT EXISTS idx_confidence_calibration_lookup ON confidence_calibration(event_type, source_type, confidence_bucket);
+CREATE INDEX IF NOT EXISTS idx_confidence_calibration_lookup ON confidence_calibration(event_type, source_type,
+    confidence_bucket);
 CREATE INDEX IF NOT EXISTS idx_ai_error_memory_active ON ai_error_memory(active, source_type, event_type, severity);
 CREATE INDEX IF NOT EXISTS idx_peer_effect_outcomes_report ON peer_effect_outcomes(report_id, outcome_label);
 CREATE INDEX IF NOT EXISTS idx_policy_updates_created ON policy_updates(created_at, source_type, event_type);
@@ -663,47 +665,96 @@ CREATE INDEX IF NOT EXISTS idx_policy_updates_created ON policy_updates(created_
 """
 
 
-@contextmanager
-def connect() -> Iterable[sqlite3.Connection]:
+BUSY_TIMEOUT_MS = 5000
+CORRUPTION_MARKERS = ("file is not a database", "malformed")
+_local = threading.local()
+
+
+def _open() -> sqlite3.Connection:
     Path(settings.database_path).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(settings.database_path)
+    con = sqlite3.connect(settings.database_path, timeout=BUSY_TIMEOUT_MS / 1000)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    con.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    return con
+
+
+def _active() -> sqlite3.Connection | None:
+    con = getattr(_local, "con", None)
+    if con is not None and getattr(_local, "path", None) == settings.database_path:
+        return con
+    return None
+
+
+@contextmanager
+def connect() -> Iterator[sqlite3.Connection]:
+    shared = _active()
+    if shared is not None:
+        yield shared
+        return
+    con = _open()
     try:
         yield con
         con.commit()
+    except BaseException:
+        con.rollback()
+        raise
     finally:
         con.close()
+
+
+@contextmanager
+def transaction() -> Iterator[sqlite3.Connection]:
+    shared = _active()
+    if shared is not None:
+        yield shared
+        return
+    con = _open()
+    _local.con, _local.path = con, settings.database_path
+    try:
+        yield con
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        _local.con = None
+        _local.path = None
+        con.close()
+
+
+@contextmanager
+def savepoint(name: str) -> Iterator[None]:
+    with transaction() as con:
+        con.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            con.execute(f"ROLLBACK TO {name}")
+            con.execute(f"RELEASE {name}")
+            raise
+        con.execute(f"RELEASE {name}")
 
 
 def _column_names(con: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
-def _migrate(con: sqlite3.Connection) -> None:
-    """Add fields safely when a user already has an older local SQLite DB."""
-    company_cols = _column_names(con, "companies")
-    if "source_urls_json" not in company_cols:
-        con.execute("ALTER TABLE companies ADD COLUMN source_urls_json TEXT NOT NULL DEFAULT '[]'")
-    if "notes" not in company_cols:
-        con.execute("ALTER TABLE companies ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
-    catalyst_cols = _column_names(con, "catalysts")
-    if "event_cluster_key" not in catalyst_cols:
-        con.execute("ALTER TABLE catalysts ADD COLUMN event_cluster_key TEXT")
-    source_doc_cols = _column_names(con, "source_docs")
-    source_doc_defaults = {
+MIGRATIONS: dict[str, dict[str, str]] = {
+    "companies": {
+        "source_urls_json": "TEXT NOT NULL DEFAULT '[]'",
+        "notes": "TEXT NOT NULL DEFAULT ''",
+    },
+    "catalysts": {"event_cluster_key": "TEXT"},
+    "source_docs": {
         "verification_status": "TEXT NOT NULL DEFAULT 'not_checked'",
         "verification_score": "REAL NOT NULL DEFAULT 0.0",
         "verification_reason": "TEXT NOT NULL DEFAULT ''",
         "verified_at": "TEXT",
         "content_hash": "TEXT NOT NULL DEFAULT ''",
         "canonical_url": "TEXT NOT NULL DEFAULT ''",
-    }
-    for col, ddl in source_doc_defaults.items():
-        if col not in source_doc_cols:
-            con.execute(f"ALTER TABLE source_docs ADD COLUMN {col} {ddl}")
-    claim_cols = _column_names(con, "claims")
-    claim_defaults = {
+    },
+    "claims": {
         "verification_status": "TEXT NOT NULL DEFAULT 'not_verified'",
         "verification_score": "REAL NOT NULL DEFAULT 0.0",
         "confidence_cap": "REAL NOT NULL DEFAULT 0.45",
@@ -711,28 +762,47 @@ def _migrate(con: sqlite3.Connection) -> None:
         "source_paragraph_id": "INTEGER",
         "verifier_reason": "TEXT NOT NULL DEFAULT ''",
         "verified_at": "TEXT",
-    }
-    for col, ddl in claim_defaults.items():
-        if col not in claim_cols:
-            con.execute(f"ALTER TABLE claims ADD COLUMN {col} {ddl}")
+    },
+    "reports": {"updated_at": "TEXT NOT NULL DEFAULT ''"},
+    "effects": {"cap_notes": "TEXT NOT NULL DEFAULT ''"},
+    "monitor_runs": {"mode": "TEXT NOT NULL DEFAULT ''"},
+}
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    for table, columns in MIGRATIONS.items():
+        existing = _column_names(con, table)
+        for column, ddl in columns.items():
+            if column not in existing:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    con.execute("DROP TABLE IF EXISTS ai_learning_notes")
+
+
+def _create_schema() -> None:
+    with connect() as con:
+        con.execute("PRAGMA journal_mode = WAL")
+        con.executescript(SCHEMA)
+        _migrate(con)
 
 
 def init_db() -> None:
     try:
-        with connect() as con:
-            con.executescript(SCHEMA)
-            _migrate(con)
+        _create_schema()
     except sqlite3.DatabaseError as exc:
-        
-        
+        message = str(exc).lower()
         db_path = Path(settings.database_path)
-        if db_path.exists():
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            backup = db_path.with_suffix(db_path.suffix + f".corrupt-{stamp}")
-            db_path.replace(backup)
-        with connect() as con:
-            con.executescript(SCHEMA)
-            _migrate(con)
+        if not any(marker in message for marker in CORRUPTION_MARKERS) or not db_path.exists():
+            raise
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        backup = db_path.with_suffix(db_path.suffix + f".corrupt-{stamp}")
+        logger.critical(
+            "Database %s is unreadable (%s). Moved it to %s and starting with an empty database.",
+            db_path,
+            exc,
+            backup,
+        )
+        db_path.replace(backup)
+        _create_schema()
 
 
 def rows(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
@@ -740,7 +810,7 @@ def rows(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         return [dict(r) for r in con.execute(sql, params).fetchall()]
 
 
-def row(sql: str, params: tuple[Any, ...] = ()) -> Optional[dict[str, Any]]:
+def row(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
     with connect() as con:
         r = con.execute(sql, params).fetchone()
         return dict(r) if r else None
@@ -748,34 +818,17 @@ def row(sql: str, params: tuple[Any, ...] = ()) -> Optional[dict[str, Any]]:
 
 def execute(sql: str, params: tuple[Any, ...] = ()) -> int:
     with connect() as con:
-        cur = con.execute(sql, params)
-        return int(cur.lastrowid)
+        return int(con.execute(sql, params).lastrowid or 0)
 
 
-def execute_many(sql: str, params_seq: list[tuple[Any, ...]]) -> None:
+def update(sql: str, params: tuple[Any, ...] = ()) -> int:
     with connect() as con:
-        con.executemany(sql, params_seq)
-
-
-def json_dumps(value: Any) -> str:
-    return json.dumps(value or [], ensure_ascii=False)
-
-
-def json_loads(value: Optional[str], default: Any = None) -> Any:
-    if not value:
-        return [] if default is None else default
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return [] if default is None else default
+        return int(con.execute(sql, params).rowcount)
 
 
 def company_from_row(r: dict[str, Any]) -> dict[str, Any]:
     item = dict(r)
-    item["aliases"] = json_loads(item.pop("aliases_json", "[]"))
-    item["targets"] = json_loads(item.pop("targets_json", "[]"))
-    item["indications"] = json_loads(item.pop("indications_json", "[]"))
-    item["peers"] = json_loads(item.pop("peers_json", "[]"))
-    item["source_urls"] = json_loads(item.pop("source_urls_json", "[]"))
+    for key in ("aliases", "targets", "indications", "peers", "source_urls"):
+        item[key] = json_loads(item.pop(f"{key}_json", "[]"), [])
     item["active"] = bool(item.get("active"))
     return item

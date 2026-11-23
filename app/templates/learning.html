@@ -1,149 +1,112 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AI Learning Dashboard · Catalyst Propagation Agent</title>
-  <link rel="stylesheet" href="/static/app.css" />
-</head>
-<body>
-  <header class="hero compact">
-    <div class="hero-copy">
-      <a class="back" href="/">← Dashboard</a>
-      <p class="eyebrow">Catalyst Outcome Learning Engine</p>
-      <h1>AI Learning Dashboard</h1>
-      <p class="sub">Tracks every candidate decision as a prediction, verifies delayed outcomes, learns source reliability, calibrates confidence, updates thresholds, records repeated AI errors, and evaluates peer read-through support.</p>
+{% extends "base.html" %}
+{% block title %}Learning · Catalyst Propagation{% endblock %}
+{% block content %}
+{% set counts = learning.prediction_counts %}
+<div class="page-head">
+  <div>
+    <h1>Learning</h1>
+    <p class="lede">Every detector decision is logged as a prediction and checked again later. The results adjust source reliability, confidence calibration and the thresholds for calling the model.</p>
+  </div>
+  <div class="actions">
+    <form action="/forms/learning/check-outcomes" method="post"><button class="btn">Check outcomes</button></form>
+    <form action="/forms/learning/policy-update" method="post"><button class="btn primary">Update policies</button></form>
+  </div>
+</div>
+
+<dl class="counts">
+  <div><dt>Predictions</dt><dd>{{ counts.total or 0 }}</dd></div>
+  <div><dt>Pending</dt><dd>{{ counts.pending or 0 }}</dd></div>
+  <div><dt>Confirmed</dt><dd>{{ counts.true_positive or 0 }}</dd></div>
+  <div><dt>False or unsupported</dt><dd>{{ counts.false_positive or 0 }}</dd></div>
+  <div><dt>Missed</dt><dd>{{ counts.false_negative or 0 }}</dd></div>
+</dl>
+
+<h2>Recent predictions</h2>
+{% if learning.recent_predictions %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Source</th><th>Decision</th><th>Event</th><th class="num">Confidence</th><th>Outcome</th></tr></thead>
+    <tbody>
+      {% for p in learning.recent_predictions %}
+      <tr>
+        <td>{{ p.source_title or p.source_url }}<div class="sub">{{ p.source_type }}</div></td>
+        <td>{{ p.predicted_decision|humanize }}</td>
+        <td>{{ (p.predicted_event_type or '')|humanize }}</td>
+        <td class="num">{{ '%.2f'|format(p.predicted_confidence) }}</td>
+        <td>{{ p.current_outcome_label|humanize }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}<p class="muted">No predictions yet. They appear after the scheduler checks sources.</p>{% endif %}
+
+<div class="split">
+  <section>
+    <h2>Source reliability</h2>
+    {% if learning.reputations %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Source</th><th>Event</th><th class="num">Seen</th><th class="num">Reliability</th></tr></thead>
+        <tbody>{% for r in learning.reputations %}<tr>
+          <td>{{ r.source_key }}</td><td>{{ r.event_type|humanize }}</td><td class="num">{{ r.total_candidates }}</td><td class="num">{{ '%.2f'|format(r.reliability_score) }}</td>
+        </tr>{% endfor %}</tbody>
+      </table>
     </div>
-    <div class="hero-actions">
-      <form action="/forms/learning/check-outcomes" method="post"><button>Check outcomes now</button></form>
-      <form action="/forms/learning/policy-update" method="post"><button class="primary">Run policy update</button></form>
-      <a class="button-link" href="/api/learning/dashboard">JSON dashboard</a>
+    {% else %}<p class="muted">Nothing learned yet.</p>{% endif %}
+  </section>
+
+  <section>
+    <h2>Thresholds</h2>
+    {% if learning.thresholds %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Source</th><th>Event</th><th class="num">Promote</th><th class="num">Review</th></tr></thead>
+        <tbody>{% for t in learning.thresholds %}<tr>
+          <td>{{ t.source_type }}</td><td>{{ t.event_type|humanize }}</td><td class="num">{{ '%.2f'|format(t.promote_threshold) }}</td><td class="num">{{ '%.2f'|format(t.review_threshold) }}</td>
+        </tr>{% endfor %}</tbody>
+      </table>
     </div>
-  </header>
+    {% else %}<p class="muted">Using default thresholds.</p>{% endif %}
+  </section>
+</div>
 
-  <main class="layout">
-    <section class="cards stats">
-      <div class="card"><span>{{ learning.prediction_counts.total or 0 }}</span><p>Total predictions</p></div>
-      <div class="card"><span>{{ learning.prediction_counts.pending or 0 }}</span><p>Pending outcomes</p></div>
-      <div class="card"><span>{{ learning.prediction_counts.true_positive or 0 }}</span><p>True positives</p></div>
-      <div class="card"><span>{{ learning.prediction_counts.false_positive or 0 }}</span><p>False/unsupported</p></div>
-      <div class="card"><span>{{ learning.prediction_counts.false_negative or 0 }}</span><p>Missed catalysts</p></div>
-    </section>
+<details>
+  <summary>Calibration, error patterns and policy changes</summary>
+  <h3>Confidence calibration</h3>
+  {% if learning.calibration %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Event</th><th>Source</th><th>Bucket</th><th class="num">Predictions</th><th class="num">Observed</th><th class="num">Multiplier</th></tr></thead>
+      <tbody>{% for c in learning.calibration %}<tr>
+        <td>{{ c.event_type }}</td><td>{{ c.source_type }}</td><td>{{ c.confidence_bucket }}</td><td class="num">{{ c.prediction_count }}</td><td class="num">{{ '%.2f'|format(c.observed_accuracy) }}</td><td class="num">{{ '%.2f'|format(c.recommended_multiplier) }}</td>
+      </tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  {% else %}<p class="muted">No calibration data yet.</p>{% endif %}
 
-    <section class="panel masterpiece-panel">
-      <p class="eyebrow">How the engine learns</p>
-      <ol class="steps">
-        <li><strong>Prediction ledger</strong><span>Every gate or AI reviewer decision is saved with source, event type, confidence, risk flags, and later evidence needed.</span></li>
-        <li><strong>Delayed outcome checks</strong><span>Predictions are rechecked after time passes using saved catalyst/report/source evidence and scheduled outcome checks.</span></li>
-        <li><strong>Policy learning</strong><span>Source reputation, confidence calibration, threshold policies, and AI error memory update future scheduler and gate behavior.</span></li>
-      </ol>
-    </section>
+  <h3>Repeated errors</h3>
+  {% if learning.errors %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pattern</th><th class="num">Seen</th><th>Rule applied</th></tr></thead>
+      <tbody>{% for e in learning.errors %}<tr>
+        <td>{{ e.error_type|humanize }}<div class="sub">{{ e.pattern_description }}</div></td><td class="num">{{ e.seen_count }}</td><td class="reason">{{ e.corrective_rule }}</td>
+      </tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  {% else %}<p class="muted">No repeated errors.</p>{% endif %}
 
-    <section class="panel">
-      <div class="section-head"><div><p class="eyebrow">Recent predictions</p><h2>Prediction ledger</h2></div></div>
-      {% if learning.recent_predictions %}
-      <div class="table-wrap"><table>
-        <thead><tr><th>ID</th><th>Source</th><th>Decision</th><th>Event</th><th>Confidence</th><th>Outcome</th><th>Reason</th></tr></thead>
-        <tbody>
-        {% for p in learning.recent_predictions %}
-          <tr>
-            <td>{{ p.id }}</td>
-            <td><span class="pill">{{ p.source_type }}</span><br><small>{{ p.source_title or p.source_url }}</small></td>
-            <td>{{ p.predicted_decision }}</td>
-            <td>{{ p.predicted_event_type }}</td>
-            <td>{{ '%.2f'|format(p.predicted_confidence) }}</td>
-            <td><span class="pill">{{ p.current_outcome_label }}</span><br><small>{{ p.last_outcome_checked_at or 'not checked' }}</small></td>
-            <td class="muted reason">{{ p.ai_reasoning_summary }}</td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table></div>
-      {% else %}<p class="empty">No predictions yet. Run the scheduler to create candidate predictions.</p>{% endif %}
-    </section>
-
-    <section class="grid two">
-      <article class="panel">
-        <p class="eyebrow">Source reliability</p>
-        <h2>Source reputation</h2>
-        {% if learning.reputations %}
-        <div class="table-wrap"><table>
-          <thead><tr><th>Source</th><th>Event</th><th>Total</th><th>TP</th><th>FP</th><th>Reliability</th><th>Noise</th></tr></thead>
-          <tbody>{% for r in learning.reputations %}<tr>
-            <td>{{ r.source_key }}<br><small>{{ r.source_type }}</small></td><td>{{ r.event_type }}</td><td>{{ r.total_candidates }}</td><td>{{ r.true_positives }}</td><td>{{ r.false_positives + r.unsupported_count }}</td><td>{{ '%.2f'|format(r.reliability_score) }}</td><td>{{ '%.2f'|format(r.noise_score) }}</td>
-          </tr>{% endfor %}</tbody>
-        </table></div>
-        {% else %}<p class="empty">No source reputation learned yet.</p>{% endif %}
-      </article>
-
-      <article class="panel">
-        <p class="eyebrow">Adaptive policies</p>
-        <h2>Gate thresholds</h2>
-        {% if learning.thresholds %}
-        <div class="table-wrap"><table>
-          <thead><tr><th>Source</th><th>Event</th><th>Promote</th><th>Review</th><th>Precision</th><th>Reason</th></tr></thead>
-          <tbody>{% for t in learning.thresholds %}<tr>
-            <td>{{ t.source_type }}</td><td>{{ t.event_type }}</td><td>{{ '%.2f'|format(t.promote_threshold) }}</td><td>{{ '%.2f'|format(t.review_threshold) }}</td><td>{{ '%.2f'|format(t.precision_score) }}</td><td class="muted reason">{{ t.policy_reason }}</td>
-          </tr>{% endfor %}</tbody>
-        </table></div>
-        {% else %}<p class="empty">No learned thresholds yet.</p>{% endif %}
-      </article>
-    </section>
-
-    <section class="grid two">
-      <article class="panel">
-        <p class="eyebrow">Confidence calibration</p>
-        <h2>Observed accuracy by bucket</h2>
-        {% if learning.calibration %}
-        <div class="table-wrap"><table>
-          <thead><tr><th>Event</th><th>Source</th><th>Bucket</th><th>Predictions</th><th>Observed</th><th>Multiplier</th></tr></thead>
-          <tbody>{% for c in learning.calibration %}<tr>
-            <td>{{ c.event_type }}</td><td>{{ c.source_type }}</td><td>{{ c.confidence_bucket }}</td><td>{{ c.prediction_count }}</td><td>{{ '%.2f'|format(c.observed_accuracy) }}</td><td>{{ '%.2f'|format(c.recommended_multiplier) }}</td>
-          </tr>{% endfor %}</tbody>
-        </table></div>
-        {% else %}<p class="empty">No calibration data yet.</p>{% endif %}
-      </article>
-
-      <article class="panel">
-        <p class="eyebrow">AI error memory</p>
-        <h2>Repeated failure patterns</h2>
-        {% if learning.errors %}
-        <div class="table-wrap"><table>
-          <thead><tr><th>Error</th><th>Source/Event</th><th>Seen</th><th>Severity</th><th>Corrective rule</th></tr></thead>
-          <tbody>{% for e in learning.errors %}<tr>
-            <td>{{ e.error_type }}<br><small>{{ e.pattern_description }}</small></td><td>{{ e.source_type }} / {{ e.event_type }}</td><td>{{ e.seen_count }}</td><td>{{ '%.2f'|format(e.severity) }}</td><td class="muted reason">{{ e.corrective_rule }}</td>
-          </tr>{% endfor %}</tbody>
-        </table></div>
-        {% else %}<p class="empty">No active error-memory patterns.</p>{% endif %}
-      </article>
-    </section>
-
-    <section class="grid two">
-      <article class="panel">
-        <p class="eyebrow">Peer read-through learning</p>
-        <h2>Peer effect outcomes</h2>
-        {% if learning.peer_outcomes %}
-        <div class="table-wrap"><table>
-          <thead><tr><th>Peer</th><th>Predicted</th><th>Type</th><th>Outcome</th><th>Reason</th></tr></thead>
-          <tbody>{% for po in learning.peer_outcomes %}<tr>
-            <td>{{ po.peer_name }}</td><td>{{ po.predicted_direction }} · {{ '%.2f'|format(po.predicted_confidence) }}</td><td>{{ po.predicted_readthrough_type }}</td><td>{{ po.outcome_label }}</td><td class="muted reason">{{ po.verifier_reason }}</td>
-          </tr>{% endfor %}</tbody>
-        </table></div>
-        {% else %}<p class="empty">No peer outcome checks yet.</p>{% endif %}
-      </article>
-
-      <article class="panel">
-        <p class="eyebrow">Recent policy updates</p>
-        <h2>What the AI changed</h2>
-        {% if learning.policy_updates %}
-        <div class="table-wrap"><table>
-          <thead><tr><th>Source/Event</th><th>Update</th><th>Old</th><th>New</th><th>Reason</th></tr></thead>
-          <tbody>{% for u in learning.policy_updates %}<tr>
-            <td>{{ u.source_type }} / {{ u.event_type }}</td><td>{{ u.update_type }}</td><td>{{ u.old_value }}</td><td>{{ u.new_value }}</td><td class="muted reason">{{ u.reason }}</td>
-          </tr>{% endfor %}</tbody>
-        </table></div>
-        {% else %}<p class="empty">No threshold-changing policy updates yet.</p>{% endif %}
-      </article>
-    </section>
-  </main>
-</body>
-</html>
+  <h3>Policy changes</h3>
+  {% if learning.policy_updates %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Scope</th><th>Change</th><th class="num">Old</th><th class="num">New</th><th>Reason</th></tr></thead>
+      <tbody>{% for u in learning.policy_updates %}<tr>
+        <td>{{ u.source_type }}, {{ u.event_type }}</td><td>{{ u.update_type|humanize }}</td><td class="num">{{ u.old_value }}</td><td class="num">{{ u.new_value }}</td><td class="reason">{{ u.reason }}</td>
+      </tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  {% else %}<p class="muted">No policy changes yet.</p>{% endif %}
+</details>
+{% endblock %}

@@ -1,13 +1,5 @@
 from __future__ import annotations
 
-"""Expert-grade deterministic fallback analysis for Catalyst Propagation.
-
-The OpenAI path should produce the richest narrative when an API key is present.
-This module exists for production resilience: when the model is unavailable, the
-app still produces transparent, source-grounded propagation analysis using an
-explicit clinical/regulatory/deal checklist rather than generic sentiment rules.
-"""
-
 import re
 from typing import Any
 
@@ -15,31 +7,76 @@ from app.services.biomed_context import extract_biomedical_context
 from app.services.clinical_extractor import extract_clinical_facts
 from app.services.evidence import is_verified_source, source_tier
 from app.services.peer_graph import indication_overlap_terms, target_overlap_terms
-from app.services.utils import clean_text, infer_direction
+from app.services.utils import clean_text, humanize, infer_direction
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+\-/]{1,}")
 _GENERIC = {
-    "same", "target", "mechanism", "indication", "competitor", "partner", "therapy", "therapies",
-    "disease", "trial", "study", "phase", "program", "data", "results", "company", "expected",
-    "readthrough", "receptor", "receptors", "protein", "proteins", "hormone", "agonist", "agonists",
-    "biology", "pathway", "drug", "clinical", "patient", "patients", "treatment", "candidate",
+    "same",
+    "target",
+    "mechanism",
+    "indication",
+    "competitor",
+    "partner",
+    "therapy",
+    "therapies",
+    "disease",
+    "trial",
+    "study",
+    "phase",
+    "program",
+    "data",
+    "results",
+    "company",
+    "expected",
+    "readthrough",
+    "receptor",
+    "receptors",
+    "protein",
+    "proteins",
+    "hormone",
+    "agonist",
+    "agonists",
+    "biology",
+    "pathway",
+    "drug",
+    "clinical",
+    "patient",
+    "patients",
+    "treatment",
+    "candidate",
 }
+
+
+def _sentences(*parts: str) -> str:
+    return " ".join(p.strip() for p in parts if p and p.strip())
 
 
 def _tokens(value: Any) -> set[str]:
     if value is None:
         return set()
-    if isinstance(value, list):
-        text = " ".join(str(x) for x in value)
-    else:
-        text = str(value)
-    return {t.strip("-/").lower() for t in _TOKEN_RE.findall(text.lower()) if len(t) > 1 and t.strip("-/").lower() not in _GENERIC}
+    text = " ".join(str(x) for x in value) if isinstance(value, list) else str(value)
+    return {
+        t.strip("-/").lower()
+        for t in _TOKEN_RE.findall(text.lower())
+        if len(t) > 1 and t.strip("-/").lower() not in _GENERIC
+    }
 
 
 def _blob(catalyst: dict[str, Any], source_docs: list[dict[str, Any]]) -> str:
-    parts = [str(catalyst.get("title") or ""), str(catalyst.get("summary") or ""), str(catalyst.get("event_type") or "")]
+    parts = [
+        str(catalyst.get("title") or ""),
+        str(catalyst.get("summary") or ""),
+        str(catalyst.get("event_type") or ""),
+    ]
     for doc in source_docs:
-        parts.extend([str(doc.get("title") or ""), str(doc.get("excerpt") or ""), str(doc.get("publisher") or ""), str(doc.get("source_type") or "")])
+        parts.extend(
+            [
+                str(doc.get("title") or ""),
+                str(doc.get("excerpt") or ""),
+                str(doc.get("publisher") or ""),
+                str(doc.get("source_type") or ""),
+            ]
+        )
     return " ".join(parts)
 
 
@@ -61,11 +98,13 @@ def _specific_claim(source_index: int, claim: str, source_count: int) -> list[di
 
 
 def _best_catalyst_source_index(source_docs: list[dict[str, Any]]) -> int:
-    """Prefer fetched/official catalyst sources over relationship-only docs."""
     if not source_docs:
         return 1
     for idx, doc in enumerate(source_docs, start=1):
-        if str(doc.get("source_type") or "").lower() not in {"peer_relationship", "watchlist_peer_evidence"} and is_verified_source(doc):
+        if str(doc.get("source_type") or "").lower() not in {
+            "peer_relationship",
+            "watchlist_peer_evidence",
+        } and is_verified_source(doc):
             return idx
     for idx, doc in enumerate(source_docs, start=1):
         if str(doc.get("source_type") or "").lower() not in {"peer_relationship", "watchlist_peer_evidence"}:
@@ -79,12 +118,22 @@ def _evidence_quality(source_docs: list[dict[str, Any]], context: dict[str, Any]
     verified = sum(1 for d in source_docs if is_verified_source(d))
     official = sum(1 for d in source_docs if source_tier(d) == "official")
     relationship = sum(1 for d in source_docs if source_tier(d).startswith("relationship"))
-    clinical_bonus = {"high": 0.16, "moderate": 0.08, "low": -0.04}.get(str(context.get("biomedical_evidence_level")), 0.0)
-    score = 0.46 + min(verified * 0.08, 0.18) + min(official * 0.07, 0.16) + min(max(len(source_docs) - relationship, 0) * 0.025, 0.08) + clinical_bonus
+    clinical_bonus = {"high": 0.16, "moderate": 0.08, "low": -0.04}.get(
+        str(context.get("biomedical_evidence_level")), 0.0
+    )
+    score = (
+        0.46
+        + min(verified * 0.08, 0.18)
+        + min(official * 0.07, 0.16)
+        + min(max(len(source_docs) - relationship, 0) * 0.025, 0.08)
+        + clinical_bonus
+    )
     return max(0.25, min(score, 0.92))
 
 
-def _event_strength(event_type: str, facts: dict[str, Any], direction: str, context: dict[str, Any]) -> tuple[float, list[str]]:
+def _event_strength(
+    event_type: str, facts: dict[str, Any], direction: str, context: dict[str, Any]
+) -> tuple[float, list[str]]:
     reasons: list[str] = []
     strength = 0.40
     level = str(context.get("biomedical_evidence_level") or "low")
@@ -114,7 +163,11 @@ def _event_strength(event_type: str, facts: dict[str, Any], direction: str, cont
             reasons.append("failed endpoint language")
     elif event_type == "fda_decision":
         strength += 0.22 if facts.get("has_regulatory_detail") else 0.08
-        reasons.append("regulatory action detail" if facts.get("has_regulatory_detail") else "regulatory catalyst with limited label detail")
+        reasons.append(
+            "regulatory action detail"
+            if facts.get("has_regulatory_detail")
+            else "regulatory catalyst with limited label detail"
+        )
         if facts.get("has_safety_detail"):
             strength += 0.04
             reasons.append("label/safety detail")
@@ -160,7 +213,11 @@ def _entity_directness(entity: str, company: dict[str, Any], text: str) -> float
     if not entity_terms:
         return 0.42
     text_terms = _tokens(text)
-    company_terms = _tokens(company.get("aliases", [])) | _tokens(company.get("targets", [])) | _tokens(company.get("indications", []))
+    company_terms = (
+        _tokens(company.get("aliases", []))
+        | _tokens(company.get("targets", []))
+        | _tokens(company.get("indications", []))
+    )
     overlap = len(entity_terms & (text_terms | company_terms)) / max(len(entity_terms), 1)
     if overlap >= 0.50:
         return 1.0
@@ -169,12 +226,24 @@ def _entity_directness(entity: str, company: dict[str, Any], text: str) -> float
     return 0.48
 
 
-def _confidence(base: float, event_strength: float, directness: float, adjustment: float = 0.0, cap: float = 0.88) -> float:
+def _confidence(
+    base: float, event_strength: float, directness: float, adjustment: float = 0.0, cap: float = 0.88
+) -> float:
     value = (base * 0.36) + (event_strength * 0.42) + (directness * 0.22) + adjustment
     return round(max(0.22, min(value, cap)), 2)
 
 
-def _target_effects(company: dict[str, Any], catalyst: dict[str, Any], source_docs: list[dict[str, Any]], direction: str, facts: dict[str, Any], context: dict[str, Any], event_strength: float, base_quality: float, source_index: int) -> list[dict[str, Any]]:
+def _target_effects(
+    company: dict[str, Any],
+    catalyst: dict[str, Any],
+    source_docs: list[dict[str, Any]],
+    direction: str,
+    facts: dict[str, Any],
+    context: dict[str, Any],
+    event_strength: float,
+    base_quality: float,
+    source_index: int,
+) -> list[dict[str, Any]]:
     targets = company.get("targets") or ["underlying drug target"]
     text = _blob(catalyst, source_docs)
     event_type = str(catalyst.get("event_type") or "other_catalyst")
@@ -182,47 +251,78 @@ def _target_effects(company: dict[str, Any], catalyst: dict[str, Any], source_do
     effects: list[dict[str, Any]] = []
     for target in targets[:3]:
         directness = _entity_directness(str(target), company, text)
-        readthrough = "validation" if direction != "neutral" and event_type in {"trial_readout", "fda_decision"} else "neutral"
+        readthrough = (
+            "validation" if direction != "neutral" and event_type in {"trial_readout", "fda_decision"} else "neutral"
+        )
         target_direction = direction
         if event_type in {"licensing_deal", "acquisition"}:
-            
-            target_direction = "positive" if direction == "positive" and context.get("biomedical_evidence_level") != "low" else "neutral"
+            target_direction = (
+                "positive"
+                if direction == "positive" and context.get("biomedical_evidence_level") != "low"
+                else "neutral"
+            )
             readthrough = "validation" if target_direction == "positive" else "neutral"
-        cap = 0.90 if context.get("biomedical_evidence_level") == "high" else 0.74 if context.get("biomedical_evidence_level") == "moderate" else 0.55
+        cap = (
+            0.90
+            if context.get("biomedical_evidence_level") == "high"
+            else 0.74
+            if context.get("biomedical_evidence_level") == "moderate"
+            else 0.55
+        )
         conf = _confidence(base_quality, event_strength, directness, cap=cap)
         if target_direction == "neutral":
             conf = min(conf, 0.55)
         if event_type == "trial_readout":
-            rationale = (
-                f"Fallback expert checklist ties the target call to trial quality instead of simple sentiment. "
-                f"Extracted facts: {fact_phrase}. "
-                f"A {direction} trial readout {'supports' if direction == 'positive' else 'weakens' if direction == 'negative' else 'does not clearly change'} confidence in {target} only to the extent the source directly links the program/target; directness={directness:.2f}."
+            verb = {"positive": "supports", "negative": "weakens"}.get(direction, "does not clearly change")
+            rationale = _sentences(
+                f"The call on {target} rests on trial quality, not headline tone.",
+                f"Extracted facts: {fact_phrase}.",
+                f"A {direction} readout {verb} confidence in {target} only as far as the source ties the program",
+                f"to this target (directness {directness:.2f}).",
             )
         elif event_type == "fda_decision":
-            rationale = (
-                f"Regulatory decision read-through for {target}: extracted facts: {fact_phrase}. "
-                f"Approval/CRL language can validate or undermine the development path, but target-biology confidence is capped unless the label/source explains mechanism, safety, and patient population."
+            rationale = _sentences(
+                f"Regulatory read-through for {target}. Extracted facts: {fact_phrase}.",
+                "An approval or complete response letter can validate or set back the development path,",
+                "but confidence in the target biology stays capped unless the label or source covers mechanism,",
+                "safety and patient population.",
             )
         elif event_type in {"licensing_deal", "acquisition"}:
-            rationale = (
-                f"Strategic transaction read-through for {target}: extracted facts: {fact_phrase}. "
-                f"Deal interest can be external validation of an asset/platform, but it is not treated as clinical proof unless the cited source gives clinical endpoint, safety, or regulatory details."
+            rationale = _sentences(
+                f"Deal read-through for {target}. Extracted facts: {fact_phrase}.",
+                "A deal signals outside interest in the asset or platform, but it is not clinical proof unless",
+                "the cited source gives endpoint, safety or regulatory detail.",
             )
         else:
-            rationale = f"Other catalyst mapped conservatively to {target}; extracted facts: {fact_phrase}. Direction is capped because catalyst specificity is limited."
-        effects.append({
-            "layer": "target",
-            "entity": str(target),
-            "direction": target_direction,
-            "confidence": conf,
-            "readthrough_type": readthrough,
-            "rationale": rationale,
-            "claims": _source_claim(source_docs, catalyst.get("title", ""), source_index),
-        })
+            rationale = _sentences(
+                f"Mapped conservatively to {target} because the catalyst is not specific.",
+                f"Extracted facts: {fact_phrase}.",
+            )
+        effects.append(
+            {
+                "layer": "target",
+                "entity": str(target),
+                "direction": target_direction,
+                "confidence": conf,
+                "readthrough_type": readthrough,
+                "rationale": rationale,
+                "claims": _source_claim(source_docs, catalyst.get("title", ""), source_index),
+            }
+        )
     return effects
 
 
-def _indication_effects(company: dict[str, Any], catalyst: dict[str, Any], source_docs: list[dict[str, Any]], direction: str, facts: dict[str, Any], context: dict[str, Any], event_strength: float, base_quality: float, source_index: int) -> list[dict[str, Any]]:
+def _indication_effects(
+    company: dict[str, Any],
+    catalyst: dict[str, Any],
+    source_docs: list[dict[str, Any]],
+    direction: str,
+    facts: dict[str, Any],
+    context: dict[str, Any],
+    event_strength: float,
+    base_quality: float,
+    source_index: int,
+) -> list[dict[str, Any]]:
     indications = company.get("indications") or ["relevant indication"]
     text = _blob(catalyst, source_docs)
     event_type = str(catalyst.get("event_type") or "other_catalyst")
@@ -230,80 +330,132 @@ def _indication_effects(company: dict[str, Any], catalyst: dict[str, Any], sourc
     effects: list[dict[str, Any]] = []
     for indication in indications[:3]:
         directness = _entity_directness(str(indication), company, text)
-        cap = 0.88 if context.get("biomedical_evidence_level") == "high" else 0.73 if context.get("biomedical_evidence_level") == "moderate" else 0.54
+        cap = (
+            0.88
+            if context.get("biomedical_evidence_level") == "high"
+            else 0.73
+            if context.get("biomedical_evidence_level") == "moderate"
+            else 0.54
+        )
         conf = _confidence(base_quality, event_strength, directness, adjustment=-0.03, cap=cap)
-        readthrough = "competitive" if direction == "positive" and event_type in {"trial_readout", "fda_decision"} else "neutral" if direction == "neutral" else "none"
+        readthrough = (
+            "competitive"
+            if direction == "positive" and event_type in {"trial_readout", "fda_decision"}
+            else "neutral"
+            if direction == "neutral"
+            else "none"
+        )
         if event_type == "fda_decision" and direction == "positive":
-            rationale = (
-                f"Indication impact for {indication}: {fact_phrase}. "
-                f"A positive FDA decision can change the treatment landscape and raise the clinical/regulatory bar, but standard-of-care impact is capped unless label population, line of therapy, safety, and comparators are explicit."
+            rationale = _sentences(
+                f"Indication impact for {indication}. Extracted facts: {fact_phrase}.",
+                "An approval can change the treatment landscape and raise the bar for later entrants.",
+                "The effect on standard of care stays capped unless label population, line of therapy,",
+                "safety and comparators are explicit.",
             )
         elif event_type == "trial_readout":
-            bar = "raises" if direction == "positive" else "lowers immediate competitive pressure but may signal shared disease/trial risk" if direction == "negative" else "does not clearly move"
-            rationale = (
-                f"Indication impact for {indication}: {fact_phrase}. "
-                f"The fallback analyzes endpoint strength, effect size, safety, sample/design, and phase before saying the event {bar} the competitive bar."
+            bar = {
+                "positive": "raises the competitive bar",
+                "negative": "eases near-term competitive pressure, though it may also point to shared disease "
+                "or trial risk",
+            }.get(direction, "does not clearly move the competitive bar")
+            rationale = _sentences(
+                f"Indication impact for {indication}. Extracted facts: {fact_phrase}.",
+                f"Judged on endpoint strength, effect size, safety, design and phase, this readout {bar}.",
             )
         elif event_type in {"licensing_deal", "acquisition"}:
-            rationale = (
-                f"Indication impact for {indication}: {fact_phrase}. "
-                f"The transaction may increase resources or strategic focus in this disease area, but it is not assumed to alter standard of care without clinical/regulatory evidence."
+            rationale = _sentences(
+                f"Indication impact for {indication}. Extracted facts: {fact_phrase}.",
+                "The deal may bring more money or focus to this disease area, but it does not change",
+                "standard of care without clinical or regulatory evidence.",
             )
             readthrough = "neutral" if direction != "negative" else "none"
             if context.get("biomedical_evidence_level") == "low":
                 conf = min(conf, 0.50)
         else:
-            rationale = f"Indication impact for {indication} is conservative because the event type/source detail is limited; extracted facts: {fact_phrase}."
-        effects.append({
-            "layer": "indication",
-            "entity": str(indication),
-            "direction": direction,
-            "confidence": conf,
-            "readthrough_type": readthrough,
-            "rationale": rationale,
-            "claims": _source_claim(source_docs, catalyst.get("title", ""), source_index),
-        })
+            rationale = _sentences(
+                f"Indication impact for {indication} is kept conservative because the event type and source detail",
+                f"are limited. Extracted facts: {fact_phrase}.",
+            )
+        effects.append(
+            {
+                "layer": "indication",
+                "entity": str(indication),
+                "direction": direction,
+                "confidence": conf,
+                "readthrough_type": readthrough,
+                "rationale": rationale,
+                "claims": _source_claim(source_docs, catalyst.get("title", ""), source_index),
+            }
+        )
     return effects
 
 
 def _relationship_source_index(peer: dict[str, Any]) -> int:
     try:
         return int(peer.get("_relationship_source_index") or 0)
-    except Exception:
+    except (TypeError, ValueError):
         return 0
 
 
 def _peer_flags(peer: dict[str, Any], company: dict[str, Any]) -> tuple[bool, bool, bool, str]:
     relationship_type = str(peer.get("relationship_type") or peer.get("relationship") or "").lower()
-    relation_blob = " ".join(str(peer.get(k, "")) for k in ["relationship", "relationship_type", "target", "indication", "expected_readthrough", "target_overlap", "indication_overlap", "source"]).lower()
-    declared_different_target = any(x in relation_blob for x in ["different target", "not same-target", "not same target", "unrelated target"])
+    relation_blob = " ".join(
+        str(peer.get(k, ""))
+        for k in [
+            "relationship",
+            "relationship_type",
+            "target",
+            "indication",
+            "expected_readthrough",
+            "target_overlap",
+            "indication_overlap",
+            "source",
+        ]
+    ).lower()
+    declared_different_target = any(
+        x in relation_blob for x in ["different target", "not same-target", "not same target", "unrelated target"]
+    )
     peer_targets = [peer.get("target", ""), peer.get("target_overlap", "")]
     peer_indications = [peer.get("indication", ""), peer.get("indication_overlap", "")]
-    computed_target_overlap = target_overlap_terms((company.get("targets") or []) + (company.get("aliases") or []), peer_targets)
+    computed_target_overlap = target_overlap_terms(
+        (company.get("targets") or []) + (company.get("aliases") or []), peer_targets
+    )
     computed_indication_overlap = indication_overlap_terms(company.get("indications", []), peer_indications)
     same_target = (
-        "same_target" in relationship_type or "same target" in relationship_type or "same-target" in relationship_type
-        or "target_validation" in relationship_type or "mixed_target" in relationship_type
-        or bool(peer.get("target_overlap")) or bool(computed_target_overlap)
+        "same_target" in relationship_type
+        or "same target" in relationship_type
+        or "same-target" in relationship_type
+        or "target_validation" in relationship_type
+        or "mixed_target" in relationship_type
+        or bool(peer.get("target_overlap"))
+        or bool(computed_target_overlap)
     ) and not declared_different_target
     same_indication = (
-        "same_indication" in relationship_type or "same indication" in relationship_type or "same-indication" in relationship_type
-        or "competitor" in relationship_type or "competition" in relationship_type or "mixed_target_and_indication" in relationship_type
-        or bool(peer.get("indication_overlap")) or bool(computed_indication_overlap)
+        "same_indication" in relationship_type
+        or "same indication" in relationship_type
+        or "same-indication" in relationship_type
+        or "competitor" in relationship_type
+        or "competition" in relationship_type
+        or "mixed_target_and_indication" in relationship_type
+        or bool(peer.get("indication_overlap"))
+        or bool(computed_indication_overlap)
     )
-    partner = any(x in relationship_type or x in relation_blob for x in ["partner", "collaboration", "royalt", "milestone", "licensee", "licensor", "commercial partner"])
-    evidence = "source-cited" if _relationship_source_index(peer) > 0 else "relationship-source-missing"
+    partner = any(
+        x in relationship_type or x in relation_blob
+        for x in ["partner", "collaboration", "royalt", "milestone", "licensee", "licensor", "commercial partner"]
+    )
+    evidence = "relationship source cited" if _relationship_source_index(peer) > 0 else "no relationship source"
     if same_target and same_indication:
-        strength = f"{evidence}; same target/mechanism plus same indication overlap"
+        overlap = "same target and same indication"
     elif same_target:
-        strength = f"{evidence}; same target/mechanism overlap"
+        overlap = "same target or mechanism"
     elif same_indication:
-        strength = f"{evidence}; same indication/market overlap"
+        overlap = "same indication"
     elif partner:
-        strength = f"{evidence}; partner/economic relationship"
+        overlap = "partner or economic relationship"
     else:
-        strength = f"{evidence}; weak or unsupported overlap"
-    return same_target, same_indication, partner, strength
+        overlap = "weak or unsupported overlap"
+    return same_target, same_indication, partner, f"{overlap}; {evidence}"
 
 
 def _peer_claims(peer: dict[str, Any], event_claim: list[dict[str, Any]], source_count: int) -> list[dict[str, Any]]:
@@ -314,12 +466,28 @@ def _peer_claims(peer: dict[str, Any], event_claim: list[dict[str, Any]], source
         relationship = peer.get("relationship") or peer.get("relationship_type") or "peer relationship"
         target = peer.get("target") or peer.get("target_overlap") or "target not specified"
         indication = peer.get("indication") or peer.get("indication_overlap") or "indication not specified"
-        claims.extend(_specific_claim(rel_idx, f"{peer_name} relationship evidence: {relationship}; target/program overlap: {target}; indication overlap: {indication}.", source_count))
+        claims.extend(
+            _specific_claim(
+                rel_idx,
+                f"{peer_name} relationship: {relationship}. Target or program overlap: {target}. "
+                f"Indication overlap: {indication}.",
+                source_count,
+            )
+        )
     claims.extend(event_claim[:1])
     return claims or event_claim
 
 
-def _peer_effect(peer: dict[str, Any], company: dict[str, Any], catalyst: dict[str, Any], source_docs: list[dict[str, Any]], direction: str, event_strength: float, base_quality: float, event_claim: list[dict[str, Any]]) -> dict[str, Any]:
+def _peer_effect(
+    peer: dict[str, Any],
+    company: dict[str, Any],
+    catalyst: dict[str, Any],
+    source_docs: list[dict[str, Any]],
+    direction: str,
+    event_strength: float,
+    base_quality: float,
+    event_claim: list[dict[str, Any]],
+) -> dict[str, Any]:
     peer_name = peer.get("company") or peer.get("name") or "Peer company"
     same_target, same_indication, partner, strength = _peer_flags(peer, company)
     source_count = len(source_docs)
@@ -333,58 +501,113 @@ def _peer_effect(peer: dict[str, Any], company: dict[str, Any], catalyst: dict[s
     if partner:
         conf = _confidence(base_quality, event_strength, 0.78, adjustment=-0.10 - evidence_penalty, cap=0.78)
         return {
-            "layer": "peer", "entity": str(peer_name), "direction": direction, "confidence": conf,
+            "layer": "peer",
+            "entity": str(peer_name),
+            "direction": direction,
+            "confidence": conf,
             "readthrough_type": "partner",
-            "rationale": f"Partner/economic read-through ({strength}). Direction follows the catalyst, but magnitude depends on contract economics, territory, royalties, opt-ins, and commercialization responsibility. {expected}",
+            "rationale": _sentences(
+                f"Partner read-through ({strength}). Direction follows the catalyst; size depends on contract",
+                "economics, territory, royalties, opt-ins and who commercializes.",
+                expected,
+            ),
             "claims": claims,
         }
     if same_target and same_indication:
-        
         if direction == "positive" and event_type in {"fda_decision", "trial_readout"}:
             peer_direction = "neutral"
-            rationale = (
-                f"Mixed peer read-through ({strength}). Same target creates validation for the class, while same indication creates competitive pressure and a higher efficacy/safety/convenience bar. "
-                f"Net is neutral unless cited evidence proves product differentiation or commercial displacement. {expected}"
+            rationale = _sentences(
+                f"Mixed read-through ({strength}). The shared target supports the class, while the shared",
+                "indication adds competition and raises the efficacy, safety and convenience bar. The net call is",
+                "neutral unless cited evidence shows product differentiation or commercial displacement.",
+                expected,
             )
         elif direction == "negative":
             peer_direction = "neutral"
-            rationale = (
-                f"Mixed negative read-through ({strength}). A failure may weaken class biology but also reduce competitive threat; net is neutral without evidence separating target-specific risk from asset-specific execution. {expected}"
+            rationale = _sentences(
+                f"Mixed read-through ({strength}). A failure can weaken the class biology but also removes a",
+                "competitor. The net call is neutral until evidence separates target risk from asset-specific",
+                "execution.",
+                expected,
             )
         else:
             peer_direction = "neutral"
-            rationale = f"Mixed same-target/same-indication relationship ({strength}); catalyst direction is too uncertain for a directional peer call. {expected}"
-        return {"layer": "peer", "entity": str(peer_name), "direction": peer_direction, "confidence": round(max(0.24, min(0.50, 0.48 - evidence_penalty)), 2), "readthrough_type": "neutral", "rationale": rationale, "claims": claims}
+            rationale = _sentences(
+                f"Mixed read-through ({strength}). The catalyst direction is too uncertain for a directional "
+                "peer call.",
+                expected,
+            )
+        return {
+            "layer": "peer",
+            "entity": str(peer_name),
+            "direction": peer_direction,
+            "confidence": round(max(0.24, min(0.50, 0.48 - evidence_penalty)), 2),
+            "readthrough_type": "neutral",
+            "rationale": rationale,
+            "claims": claims,
+        }
     if same_target:
         conf = _confidence(base_quality, event_strength, 0.72, adjustment=-0.16 - evidence_penalty, cap=0.72)
         return {
-            "layer": "peer", "entity": str(peer_name), "direction": direction, "confidence": conf,
+            "layer": "peer",
+            "entity": str(peer_name),
+            "direction": direction,
+            "confidence": conf,
             "readthrough_type": "validation",
-            "rationale": f"Validation read-through ({strength}). The event can strengthen or weaken confidence in the shared biology/mechanism, but confidence is below the direct company effect because peer asset design, stage, dose, and population may differ. {expected}",
+            "rationale": _sentences(
+                f"Validation read-through ({strength}). The event can raise or lower confidence in the shared",
+                "biology, but by less than for the company itself, since peer assets can differ in design, stage,",
+                "dose and population.",
+                expected,
+            ),
             "claims": claims,
         }
     if same_indication:
         if direction == "positive":
             peer_direction = "negative"
-            rationale = f"Competitive read-through ({strength}). A positive event in the same indication can raise endpoint, safety, convenience, label, or commercial expectations for rivals. {expected}"
+            rationale = _sentences(
+                f"Competitive read-through ({strength}). A positive event in the same indication raises the",
+                "endpoint, safety, convenience, label or commercial bar for rivals.",
+                expected,
+            )
         elif direction == "negative":
             peer_direction = "positive"
-            rationale = f"Competitive read-through ({strength}). A negative event can reduce immediate competitive pressure, but confidence is capped because it may also reveal shared disease/trial risk. {expected}"
+            rationale = _sentences(
+                f"Competitive read-through ({strength}). A negative event can ease near-term competitive pressure.",
+                "Confidence is capped because it may also point to shared disease or trial risk.",
+                expected,
+            )
         else:
             peer_direction = "neutral"
-            rationale = f"Same-indication relationship exists ({strength}), but the event is not directional enough to infer competitive displacement. {expected}"
+            rationale = _sentences(
+                f"Same-indication peer ({strength}), but the event is not directional enough to call a",
+                "competitive effect.",
+                expected,
+            )
         conf = _confidence(base_quality, event_strength, 0.66, adjustment=-0.20 - evidence_penalty, cap=0.68)
-        return {"layer": "peer", "entity": str(peer_name), "direction": peer_direction, "confidence": conf, "readthrough_type": "competitive", "rationale": rationale, "claims": claims}
+        return {
+            "layer": "peer",
+            "entity": str(peer_name),
+            "direction": peer_direction,
+            "confidence": conf,
+            "readthrough_type": "competitive",
+            "rationale": rationale,
+            "claims": claims,
+        }
     return {
-        "layer": "peer", "entity": str(peer_name), "direction": "neutral", "confidence": 0.24,
+        "layer": "peer",
+        "entity": str(peer_name),
+        "direction": "neutral",
+        "confidence": 0.24,
         "readthrough_type": "none",
-        "rationale": "No reliable target, indication, or partner relationship was found. The fallback does not assume blanket biotech contagion.",
+        "rationale": "No reliable target, indication or partner link was found, so no read-through is assumed.",
         "claims": event_claim,
     }
 
 
-def expert_fallback_analysis(company: dict[str, Any], catalyst: dict[str, Any], source_docs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Generate a deterministic propagation report with clinical-quality reasoning."""
+def expert_fallback_analysis(
+    company: dict[str, Any], catalyst: dict[str, Any], source_docs: list[dict[str, Any]]
+) -> dict[str, Any]:
     text = _blob(catalyst, source_docs)
     direction, sentiment_conf = infer_direction(catalyst.get("title", ""), text)
     context = extract_biomedical_context(catalyst, source_docs)
@@ -395,27 +618,44 @@ def expert_fallback_analysis(company: dict[str, Any], catalyst: dict[str, Any], 
     source_index = _best_catalyst_source_index(source_docs)
     event_claim = _source_claim(source_docs, catalyst.get("title", ""), source_index)
 
-    
-    overall_conf = round(max(0.24, min((sentiment_conf * 0.22) + (base_quality * 0.38) + (event_strength * 0.40), 0.90)), 2)
-    if context.get("biomedical_evidence_level") == "low" and event_type in {"trial_readout", "fda_decision", "licensing_deal", "acquisition"}:
+    overall_conf = round(
+        max(0.24, min((sentiment_conf * 0.22) + (base_quality * 0.38) + (event_strength * 0.40), 0.90)), 2
+    )
+    if context.get("biomedical_evidence_level") == "low" and event_type in {
+        "trial_readout",
+        "fda_decision",
+        "licensing_deal",
+        "acquisition",
+    }:
         overall_conf = min(overall_conf, 0.56)
 
     effects: list[dict[str, Any]] = []
-    effects.extend(_target_effects(company, catalyst, source_docs, direction, facts, context, event_strength, base_quality, source_index))
-    effects.extend(_indication_effects(company, catalyst, source_docs, direction, facts, context, event_strength, base_quality, source_index))
+    effects.extend(
+        _target_effects(
+            company, catalyst, source_docs, direction, facts, context, event_strength, base_quality, source_index
+        )
+    )
+    effects.extend(
+        _indication_effects(
+            company, catalyst, source_docs, direction, facts, context, event_strength, base_quality, source_index
+        )
+    )
     for peer in (company.get("peers") or [])[:18]:
         if isinstance(peer, dict):
-            effects.append(_peer_effect(peer, company, catalyst, source_docs, direction, event_strength, base_quality, event_claim))
+            effects.append(
+                _peer_effect(peer, company, catalyst, source_docs, direction, event_strength, base_quality, event_claim)
+            )
 
     missing = context.get("missing_critical_fields") or []
     strength_text = ", ".join(strength_reasons) if strength_reasons else "limited concrete catalyst detail"
-    summary = (
-        f"Expert fallback report: the system detected a {event_type} with {direction} direction. "
-        f"It reviewed trial/regulatory/deal specifics before propagating effects: {context.get('clinical_summary')}. "
-        f"Evidence level is {context.get('biomedical_evidence_level')} based on {strength_text}."
+    company_name = company.get("name") or "the company"
+    summary = _sentences(
+        f"Rule-based read of a {direction} {humanize(event_type)} for {company_name}.",
+        f"Extracted detail: {context.get('clinical_summary')}.",
+        f"Evidence level is {context.get('biomedical_evidence_level')}, based on {strength_text}.",
     )
     if missing:
-        summary += " Missing fields that limit confidence: " + ", ".join(missing) + "."
+        summary += " Confidence is limited by missing " + ", ".join(missing) + "."
 
     return {
         "event_type": event_type,

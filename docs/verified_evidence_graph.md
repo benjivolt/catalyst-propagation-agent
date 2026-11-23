@@ -1,67 +1,34 @@
-# Verified Evidence Graph
+# Claim verification
 
-The Verified Evidence Graph is a report-publishing trust layer for the Catalyst Propagation Agent. It turns each generated claim into a verifiable evidence object instead of treating citations as simple links.
+After a report is saved, `app/services/verified_evidence_graph.py` checks every cited claim against the stored text of its sources and caps confidence where the support is thin. It runs locally with no model calls.
 
-## Pipeline
+## Steps
 
-```text
-source_docs
--> source_snapshots
--> source_paragraphs
--> atomic_claims
--> claim_evidence_spans
--> claim_verification_summary
--> confidence caps and human-review gate
-```
+1. Snapshot each source document attached to the catalyst (title, publisher, excerpt and any stored page text) into `source_snapshots`, with a content hash. Pages are not re-fetched here.
+2. Split each snapshot into paragraphs with character offsets (`source_paragraphs`).
+3. Store each report claim as an `atomic_claims` row and classify it: regulatory, trial result, deal, drug or target, peer relationship, propagation inference, or background.
+4. Rank candidate paragraphs for the claim and score the best ones (`claim_evidence_spans`): token coverage of the claim, entity match, source quality, and a simple contradiction check for opposite-direction wording. These are lexical scores, not a trained entailment model.
+5. Write one verdict per claim to `claim_verification_summary` and lower the parent effect's confidence to the lowest cap among its claims (never below 0.25).
 
-## Database tables
+## Verdicts and caps
 
-- `source_snapshots`: stores the exact source text used at analysis time, with URL, content hash, timestamp, and archive pointer.
-- `source_paragraphs`: splits snapshots into citable paragraph/span units with character offsets.
-- `atomic_claims`: stores independently verifiable claims connected to the original report/effect/claim.
-- `claim_evidence_spans`: stores exact quotes, paragraph IDs, retrieval score, coverage score, entailment label, contradiction score, and verifier model.
-- `claim_verification_summary`: stores final status, confidence cap, required source type, publishability, and failure reason.
+| Verdict | Meaning | Cap |
+| --- | --- | --- |
+| verified | Passage covers the claim and the source type suits the claim | 0.88 |
+| weakly verified | Partial coverage | 0.60 |
+| needs human review | Related passage, not enough to decide | 0.50 |
+| unsupported | Passage does not back the claim | 0.35 |
+| contradicted | Passage points the other way | 0.35 |
 
-## Claim statuses
+Further limits apply on top of these: 0.20 when the claim has no source, 0.45 when no passage was quoted, 0.72 when the source is neither verified nor official, 0.55 for a peer-relationship claim not backed by a peer-relationship source, and a per-claim-type ceiling when the source type is not one the claim type prefers (for example 0.60 for a deal claim without an SEC filing or company release).
 
-- `verified`: exact span directly supports the claim with a preferred source type.
-- `weakly_verified`: source is relevant but support is partial or source type is not ideal.
-- `unsupported`: source is related but does not prove the claim.
-- `contradicted`: the span contains opposing evidence.
-- `needs_human_review`: enough relevance exists to inspect manually, but the system cannot safely publish as a strong fact.
+The report gets a grade from A to D based on how many claims are verified. Its overall confidence is capped at 0.92, 0.80, 0.65 or 0.48 for A to D, and any grade below A puts the report back into the review queue.
 
-## Confidence caps
-
-The system caps claims and effect confidence using strict rules:
-
-- No source: max 20%.
-- No exact quote: max 45%.
-- Unsupported: max 35%.
-- Contradicted: max 35%.
-- Not enough information: max 50%.
-- Partial support: max 60%.
-- Regulatory claim without preferred regulatory/company/SEC source: max 60%.
-- Peer relationship claim without peer evidence: max 55%.
-
-## UI
-
-Each report page now includes a Verified Evidence Graph panel and claim-level evidence cards showing:
-
-- verification status,
-- entailment score,
-- confidence cap,
-- exact quote,
-- verifier reason.
-
-## Endpoints
+## API
 
 ```text
 GET  /api/reports/{report_id}/evidence-graph
 POST /api/reports/{report_id}/verify-evidence-graph
 ```
 
-## Test
-
-```bash
-python scripts/test_verified_evidence_graph.py
-```
+Tests: `tests/test_verified_evidence_graph.py`.

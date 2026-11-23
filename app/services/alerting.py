@@ -9,7 +9,7 @@ import httpx
 
 from app.config import settings
 from app.db import execute, row, rows
-from app.services.utils import clean_text
+from app.services.utils import clean_text, redact_secrets
 
 
 def _report_payload(report_id: int) -> dict[str, Any]:
@@ -26,7 +26,11 @@ def _report_payload(report_id: int) -> dict[str, Any]:
     if not report:
         raise ValueError(f"Report {report_id} not found")
     audit = row("SELECT * FROM analysis_audits WHERE report_id = ?", (report_id,)) or {}
-    effects = rows("SELECT layer, entity, direction, confidence, readthrough_type FROM effects WHERE report_id = ? ORDER BY layer, confidence DESC LIMIT 8", (report_id,))
+    effects = rows(
+        "SELECT layer, entity, direction, confidence, readthrough_type FROM effects "
+        "WHERE report_id = ? ORDER BY layer, confidence DESC LIMIT 8",
+        (report_id,),
+    )
     return {
         "report_id": report_id,
         "company": f"{report['company_name']} ({report['ticker']})" if report.get("ticker") else report["company_name"],
@@ -41,18 +45,28 @@ def _report_payload(report_id: int) -> dict[str, Any]:
     }
 
 
+def _slack_escape(value: Any) -> str:
+    return str(value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _message_text(payload: dict[str, Any]) -> str:
+    payload = {k: (_slack_escape(clean_text(v, 600)) if isinstance(v, str) else v) for k, v in payload.items()}
     confidence = round(float(payload.get("overall_confidence") or 0) * 100)
     lines = [
         f"Catalyst Propagation Alert: {payload.get('company')}",
         f"Event: {payload.get('catalyst_title')}",
         f"Direction/confidence: {payload.get('overall_direction')} / {confidence}%",
-        f"Evidence grade: {payload.get('evidence_grade')} | Citation coverage: {round(float(payload.get('citation_coverage') or 0) * 100)}%",
+        f"Evidence grade: {payload.get('evidence_grade')} | Citation coverage: "
+        f"{round(float(payload.get('citation_coverage') or 0) * 100)}%",
         f"Summary: {payload.get('summary')}",
         "Top effects:",
     ]
     for effect in payload.get("effects") or []:
-        lines.append(f"- {effect.get('layer')}: {effect.get('entity')} → {effect.get('direction')} ({round(float(effect.get('confidence') or 0) * 100)}%, {effect.get('readthrough_type')})")
+        effect = {k: (_slack_escape(clean_text(v, 200)) if isinstance(v, str) else v) for k, v in effect.items()}
+        lines.append(
+            f"- {effect.get('layer')}: {effect.get('entity')} → {effect.get('direction')} "
+            f"({round(float(effect.get('confidence') or 0) * 100)}%, {effect.get('readthrough_type')})"
+        )
     return "\n".join(lines)
 
 
@@ -62,17 +76,23 @@ def _record(report_id: int, channel: str, target: str, status: str, payload: dic
         INSERT INTO alert_deliveries (report_id, channel, target, status, payload_json, error)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (report_id, channel, target[:500], status, json.dumps(payload, ensure_ascii=False), clean_text(error, 1000)),
+        (
+            report_id,
+            channel,
+            target[:500],
+            status,
+            json.dumps(payload, ensure_ascii=False),
+            clean_text(redact_secrets(error), 1000),
+        ),
     )
 
 
 def send_report_alert(report_id: int, *, force: bool = False) -> dict[str, Any]:
-    """Send a report alert through configured channels and record delivery status.
-
-    Channels are opt-in through .env so local demos never leak data. Supported:
-    Slack incoming webhook and SMTP email.
-    """
     payload = _report_payload(report_id)
+    review = row("SELECT status FROM report_reviews WHERE report_id = ?", (report_id,))
+    if not review or review.get("status") != "approved":
+        _record(report_id, "none", "not_approved", "skipped", payload, "Report has not been approved by a reviewer")
+        return {"status": "skipped", "reason": "not_approved", "deliveries": 0}
     if not force and not settings.alerts_enabled:
         _record(report_id, "none", "alerts_disabled", "skipped", payload, "ALERTS_ENABLED=false")
         return {"status": "skipped", "reason": "alerts_disabled", "deliveries": 0}
@@ -86,11 +106,11 @@ def send_report_alert(report_id: int, *, force: bool = False) -> dict[str, Any]:
             with httpx.Client(timeout=settings.request_timeout_seconds) as client:
                 resp = client.post(settings.slack_webhook_url, json={"text": text})
                 resp.raise_for_status()
-            _record(report_id, "slack", settings.slack_webhook_url, "sent", payload)
+            _record(report_id, "slack", "slack_webhook", "sent", payload)
             deliveries += 1
         except Exception as exc:
-            failures.append(f"slack: {exc}")
-            _record(report_id, "slack", settings.slack_webhook_url, "failed", payload, str(exc))
+            failures.append(f"slack: {redact_secrets(str(exc))}")
+            _record(report_id, "slack", "slack_webhook", "failed", payload, str(exc))
 
     if settings.smtp_host and settings.alert_email_to:
         try:
