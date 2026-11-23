@@ -420,6 +420,8 @@ def redirect(path: str) -> RedirectResponse:
         or any(ord(char) < 32 or ord(char) == 127 for char in decoded)
     ):
         raise HTTPException(status_code=400, detail="Invalid redirect target")
+    if urlsplit(path).netloc or urlsplit(path).scheme:
+        raise HTTPException(status_code=400, detail="Invalid redirect target")
     return RedirectResponse(path, status_code=303)
 
 
