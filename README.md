@@ -43,12 +43,12 @@ python scripts/check_openai_key.py
 
 ```bash
 docker build -t catalyst-propagation .
-docker run -p 8080:8080 -v catalyst-data:/data \
-  -e APP_PASSWORD=change-me -e ALLOWED_HOSTS=localhost,127.0.0.1 \
+docker run --rm -p 127.0.0.1:8080:8080 -v catalyst-data:/data \
+  -e ALLOWED_HOSTS=localhost,127.0.0.1 \
   catalyst-propagation
 ```
 
-The container listens on all interfaces, so set `APP_PASSWORD` before you publish the port anywhere else.
+This command publishes the port on localhost only. Before enabling remote access, set a strong, unique `APP_PASSWORD` and put the app behind HTTPS.
 
 ## Configuration
 
